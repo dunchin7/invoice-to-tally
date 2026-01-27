@@ -20,13 +20,13 @@ def generate_tally_xml(invoice: dict, output_path: str):
 
     voucher = SubElement(tallymessage, "VOUCHER", VCHTYPE="Sales", ACTION="Create")
 
-    # --- BASIC FIELDS ---
+    # Basic fields
     SubElement(voucher, "DATE").text = invoice["invoice_date"]
     SubElement(voucher, "VOUCHERNUMBER").text = invoice["invoice_number"]
     SubElement(voucher, "PARTYLEDGERNAME").text = invoice["buyer"]
     SubElement(voucher, "NARRATION").text = "Imported from Invoice AI"
 
-    # --- SALES LINE ITEMS ---
+    # Ledger Entries (Sales)
     for item in invoice["line_items"]:
         ledger_entry = SubElement(voucher, "ALLLEDGERENTRIES.LIST")
 
@@ -34,7 +34,7 @@ def generate_tally_xml(invoice: dict, output_path: str):
         SubElement(ledger_entry, "ISDEEMEDPOSITIVE").text = "No"
         SubElement(ledger_entry, "AMOUNT").text = str(item["total_price"])
 
-    # --- TAX ENTRY ---
+    # Tax Entry
     if invoice.get("tax", 0) > 0:
         tax_entry = SubElement(voucher, "ALLLEDGERENTRIES.LIST")
 
@@ -42,7 +42,7 @@ def generate_tally_xml(invoice: dict, output_path: str):
         SubElement(tax_entry, "ISDEEMEDPOSITIVE").text = "No"
         SubElement(tax_entry, "AMOUNT").text = str(invoice["tax"])
 
-    # --- PARTY LEDGER (RECEIVABLE) ---
+    # Party Ledger Entry (Receivable)
     party_entry = SubElement(voucher, "ALLLEDGERENTRIES.LIST")
 
     SubElement(party_entry, "LEDGERNAME").text = invoice["buyer"]
