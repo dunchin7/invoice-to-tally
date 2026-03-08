@@ -60,9 +60,9 @@ def main():
     with open(args.report_output, "w", encoding="utf-8") as f:
         json.dump(
             {
-                "warnings": result.report.warnings,
-                "errors": result.report.errors,
-                "confidence_flags": result.report.confidence_flags,
+                "warnings": list(result.report.warnings),
+                "errors": list(result.report.errors),
+                "confidence_flags": dict(result.report.confidence_flags),
                 "critical_failure": result.report.critical_failure,
             },
             f,
