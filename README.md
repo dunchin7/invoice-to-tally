@@ -28,6 +28,7 @@ Invoice (PDF/Image)
 invoice-to-tally/
 │
 ├── main.py                 # CLI entrypoint
+├── settings.py             # Centralized env/config settings
 ├── requirements.txt        # Python dependencies
 ├── .env                    # Gemini API key (not committed)
 ├── .gitignore
@@ -65,35 +66,80 @@ invoice-to-tally/
 
 * Python 3.10+ (tested with Python 3.12)
 
-### 2) Tesseract OCR
+### 2) OCR binaries
 
-Download and install:
+You need:
 
+* **Tesseract OCR** (`tesseract` executable)
+* **Poppler** (`pdftoppm` executable, used for PDF conversion)
+
+Install references:
+
+* Tesseract: <https://github.com/UB-Mannheim/tesseract/wiki>
+* Poppler Windows builds: <https://github.com/oschwartz10612/poppler-windows/releases>
+
+### 3) Configure OCR paths (optional but recommended)
+
+The app reads OCR executable settings from environment variables:
+
+* `TESSERACT_CMD` → full path to `tesseract` executable
+* `POPPLER_PATH` → folder containing Poppler binaries (the folder that includes `pdftoppm`)
+
+If unset, the app uses system defaults (`PATH`).
+
+#### Linux / macOS examples
+
+```bash
+# Use system binaries from PATH (no extra config)
+python main.py --input samples/sample_invoice.pdf
+
+# Or explicitly set custom locations
+export TESSERACT_CMD=/usr/local/bin/tesseract
+export POPPLER_PATH=/usr/local/opt/poppler/bin
+python main.py --input samples/sample_invoice.pdf
 ```
-https://github.com/UB-Mannheim/tesseract/wiki
+
+#### Windows (PowerShell) examples
+
+```powershell
+# Use explicit install locations
+$env:TESSERACT_CMD = "C:\Program Files\Tesseract-OCR\tesseract.exe"
+$env:POPPLER_PATH = "C:\poppler-25.12.0\Library\bin"
+python main.py --input samples/sample_invoice.pdf
 ```
 
-Default install path used in code:
+#### Docker-friendly example
 
-```
-C:\Program Files\Tesseract-OCR\tesseract.exe
-```
-
-### 3) Poppler (for PDF support)
-
-Download Poppler for Windows:
-
-```
-https://github.com/oschwartz10612/poppler-windows/releases
+```dockerfile
+ENV TESSERACT_CMD=/usr/bin/tesseract
+ENV POPPLER_PATH=/usr/bin
 ```
 
-Extract to:
+> Runtime validation is input-aware: image OCR requires **Tesseract**; PDF OCR requires **Tesseract + Poppler**. Errors clearly list what is missing.
 
-```
-C:\poppler-25.12.0\Library\bin
-```
 
-> ⚠️ The Poppler path is hard-wired in `ocr/ocr_engine.py` for reliability.
+### Why OCR binaries are required (and accuracy impact)
+
+This project uses Python wrappers (`pytesseract`, `pdf2image`) around native OCR tools:
+
+* `pytesseract` **does not include OCR itself**; it calls the external `tesseract` binary.
+* `pdf2image` converts PDFs via Poppler tools (notably `pdftoppm`) before OCR.
+
+For best extraction quality, use current stable Tesseract/Poppler builds and clear PDF/image inputs (higher DPI, non-blurry scans).
+
+### Can we include OCR binaries in this repo?
+
+Short answer: **not recommended**.
+
+* Binary artifacts are large and will bloat git history.
+* Cross-platform binaries differ (Linux/macOS/Windows), so one repo copy will not fit all environments.
+* Packaging and redistribution/licensing obligations are easier to manage via OS packages or Docker base images.
+* Security and patching are better handled by package managers or maintained container images.
+
+Recommended approach:
+
+* Install OCR binaries at deploy/runtime layer (host VM, CI image, or Docker image).
+* Pass locations with `TESSERACT_CMD` / `POPPLER_PATH` when paths are non-standard.
 
 ---
 
@@ -159,89 +205,17 @@ python main.py --input samples/sample_invoice.pdf
 outputs/invoice_structured.json
 ```
 
-Example:
-
-```json
-{
-  "invoice_number": "INV-3337",
-  "invoice_date": "January 25, 2016",
-  "seller": "DEMO - Sliced Invoices | Suite 5A-1204 123 Somewhere Street Your City AZ 12345",
-  "buyer": "Test Business | 123 Somewhere St Melbourne, VIC 3000",
-  "line_items": [
-    {
-      "description": "Web Design - This is a sample description...",
-      "quantity": 1.0,
-      "unit_price": 85.0,
-      "total_price": 85.0
-    }
-  ],
-  "subtotal": 85.0,
-  "tax": 8.5,
-  "total": 93.5,
-  "currency": "AUD"
-}
-```
-
----
-
 ### 2) Tally XML
 
 ```
 outputs/tally_invoice.xml
 ```
 
-Example:
-
-```xml
-<?xml version='1.0' encoding='utf-8'?>
-<ENVELOPE>
-  <HEADER>
-    <TALLYREQUEST>Import Data</TALLYREQUEST>
-  </HEADER>
-  <BODY>
-    <IMPORTDATA>
-      <REQUESTDESC>
-        <REPORTNAME>Vouchers</REPORTNAME>
-      </REQUESTDESC>
-      <REQUESTDATA>
-        <TALLYMESSAGE>
-          <VOUCHER VCHTYPE="Sales" ACTION="Create">
-            <DATE>January 25, 2016</DATE>
-            <VOUCHERNUMBER>INV-3337</VOUCHERNUMBER>
-            <PARTYLEDGERNAME>Test Business | 123 Somewhere St Melbourne, VIC 3000</PARTYLEDGERNAME>
-            <NARRATION>Imported from Invoice AI</NARRATION>
-
-            <ALLLEDGERENTRIES.LIST>
-              <LEDGERNAME>Sales</LEDGERNAME>
-              <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-              <AMOUNT>85.0</AMOUNT>
-            </ALLLEDGERENTRIES.LIST>
-
-            <ALLLEDGERENTRIES.LIST>
-              <LEDGERNAME>Tax</LEDGERNAME>
-              <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
-              <AMOUNT>8.5</AMOUNT>
-            </ALLLEDGERENTRIES.LIST>
-
-            <ALLLEDGERENTRIES.LIST>
-              <LEDGERNAME>Test Business | 123 Somewhere St Melbourne, VIC 3000</LEDGERNAME>
-              <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
-              <AMOUNT>93.5</AMOUNT>
-            </ALLLEDGERENTRIES.LIST>
-
-          </VOUCHER>
-        </TALLYMESSAGE>
-      </REQUESTDATA>
-    </IMPORTDATA>
-  </BODY>
-</ENVELOPE>
-```
-
 ---
 
 ## 🧠 Architecture Notes
 
-* **OCR Layer:** Tesseract + Poppler
+* **OCR Layer:** Tesseract + Poppler (env-driven config)
 * **LLM Layer:** Gemini via `google-genai`
 * **Normalization:** Fixes inconsistent field names, numeric strings, nested objects
 * **Validation:** JSON Schema ensures correctness
@@ -255,45 +229,3 @@ Example:
 * Tax is not split into CGST/SGST/IGST
 * Buyer/seller ledgers must exist in Tally
 * Works best with clean printed invoices
-
----
-
-## 🔮 Future Enhancements
-
-* Batch processing of invoice folders
-* OpenAI / Azure fallback for LLM
-* Automatic ledger creation
-* GST ledger mapping
-* Multi-line invoice support
-* Configurable XML templates
-
----
-
-## 👨‍💻 Demo Script (What to Say)
-
-> We take a raw invoice PDF, extract text using OCR, pass it to Gemini for structured field extraction, normalize and validate the output against a strict schema, then generate a Tally-compatible XML voucher.
-
-Then run:
-
-```
-python main.py --input samples/sample_invoice.pdf
-```
-
----
-
-## 📜 License
-
-MIT License
-
----
-
-## ✅ Status
-
-This is a working proof-of-work prototype demonstrating:
-
-* Invoice OCR
-* LLM-powered field extraction
-* Schema validation
-* Accounting-system XML generation
-
-**Ready for demo and iteration.**
