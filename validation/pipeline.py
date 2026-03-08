@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import copy
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Mapping
+from types import MappingProxyType
+from typing import Any, Dict, List, Mapping, Tuple
 
 from jsonschema import ValidationError, validate
 
@@ -43,15 +44,15 @@ TAX_KEY_CANDIDATES = (
 
 @dataclass(frozen=True)
 class ValidationReport:
-    warnings: List[str] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
-    confidence_flags: Dict[str, bool] = field(default_factory=dict)
-    critical_failure: bool = False
+    warnings: Tuple[str, ...]
+    errors: Tuple[str, ...]
+    confidence_flags: Mapping[str, bool]
+    critical_failure: bool
 
 
 @dataclass(frozen=True)
 class NormalizationResult:
-    normalized: Dict[str, Any]
+    normalized: Mapping[str, Any]
     report: ValidationReport
 
 
@@ -137,7 +138,7 @@ def _normalize_date(value: Any) -> tuple[str, List[str], bool]:
     return raw, warnings, False
 
 
-def _normalize_tax(data: Dict[str, Any], warnings: List[str]) -> float | None:
+def _normalize_tax(data: Dict[str, Any], warnings: List[str], confidence_flags: Dict[str, bool]) -> float:
     chosen = None
     for key in TAX_KEY_CANDIDATES:
         if key in data:
@@ -146,16 +147,19 @@ def _normalize_tax(data: Dict[str, Any], warnings: List[str]) -> float | None:
 
     if chosen is None:
         warnings.append("No tax/GST field found; defaulting tax to 0.0.")
+        confidence_flags["tax_confident"] = False
         return 0.0
 
     tax_value = _to_number(data.get(chosen))
     if tax_value is None:
         warnings.append(f"Tax field '{chosen}' was not numeric; defaulting tax to 0.0.")
+        confidence_flags["tax_confident"] = False
         return 0.0
 
     if chosen != "tax":
         warnings.append(f"Mapped '{chosen}' to canonical 'tax'.")
 
+    confidence_flags["tax_confident"] = True
     return tax_value
 
 
@@ -233,6 +237,13 @@ def _cross_field_checks(data: Dict[str, Any], report_errors: List[str], confiden
         )
 
 
+def _freeze_normalized(data: Dict[str, Any]) -> Mapping[str, Any]:
+    frozen_items = tuple(MappingProxyType(dict(item)) for item in data.get("line_items", []))
+    frozen = dict(data)
+    frozen["line_items"] = frozen_items
+    return MappingProxyType(frozen)
+
+
 def run_normalization_pipeline(raw_data: Dict[str, Any], allow_critical_override: bool = False) -> NormalizationResult:
     data = copy.deepcopy(raw_data) if raw_data is not None else {}
 
@@ -260,13 +271,19 @@ def run_normalization_pipeline(raw_data: Dict[str, Any], allow_critical_override
     if normalized["subtotal"] is None:
         normalized["subtotal"] = 0.0
         warnings.append("subtotal was not numeric; defaulted to 0.0.")
+        confidence_flags["subtotal_confident"] = False
+    else:
+        confidence_flags["subtotal_confident"] = True
 
-    normalized["tax"] = _normalize_tax(data, warnings)
+    normalized["tax"] = _normalize_tax(data, warnings, confidence_flags)
 
     normalized["total"] = _to_number(data.get("total"))
     if normalized["total"] is None:
         normalized["total"] = 0.0
         warnings.append("total was not numeric; defaulted to 0.0.")
+        confidence_flags["total_confident"] = False
+    else:
+        confidence_flags["total_confident"] = True
 
     normalized["line_items"] = _normalize_line_items(data.get("line_items", []), warnings, confidence_flags)
 
@@ -281,9 +298,9 @@ def run_normalization_pipeline(raw_data: Dict[str, Any], allow_critical_override
 
     critical_failure = bool(errors)
     report = ValidationReport(
-        warnings=warnings,
-        errors=errors,
-        confidence_flags=confidence_flags,
+        warnings=tuple(warnings),
+        errors=tuple(errors),
+        confidence_flags=MappingProxyType(dict(confidence_flags)),
         critical_failure=critical_failure,
     )
 
@@ -294,4 +311,12 @@ def run_normalization_pipeline(raw_data: Dict[str, Any], allow_critical_override
             f"Errors: {' | '.join(errors)}"
         )
 
-    return NormalizationResult(normalized=normalized, report=report)
+    return NormalizationResult(normalized=_freeze_normalized(normalized), report=report)
+
+
+def to_mutable_invoice(normalized: Mapping[str, Any]) -> Dict[str, Any]:
+    """Convert immutable normalized payload back to plain dict/list for downstream consumers."""
+    line_items = [dict(item) for item in normalized.get("line_items", ())]
+    mutable = dict(normalized)
+    mutable["line_items"] = line_items
+    return mutable

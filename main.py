@@ -5,7 +5,7 @@ import os
 from llm.extractor import extract_invoice_fields
 from ocr.ocr_engine import extract_text
 from tally.xml_generator import generate_tally_xml
-from validation.pipeline import run_normalization_pipeline
+from validation.pipeline import run_normalization_pipeline, to_mutable_invoice
 
 
 def main():
@@ -51,9 +51,11 @@ def main():
         allow_critical_override=args.allow_accounting_override,
     )
 
+    normalized_payload = to_mutable_invoice(result.normalized)
+
     # ---- SAVE JSON ----
     with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(result.normalized, f, indent=2)
+        json.dump(normalized_payload, f, indent=2)
 
     with open(args.report_output, "w", encoding="utf-8") as f:
         json.dump(
@@ -71,7 +73,7 @@ def main():
     print(f"[+] Validation report saved to: {args.report_output}")
 
     # ---- GENERATE TALLY XML ----
-    generate_tally_xml(result.normalized, args.tally_output)
+    generate_tally_xml(normalized_payload, args.tally_output)
 
     print(f"[+] Tally XML saved to: {args.tally_output}")
 
