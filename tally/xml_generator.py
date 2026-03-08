@@ -1,6 +1,12 @@
 from xml.etree.ElementTree import Element, SubElement, ElementTree
 
 
+def _party_ledger_name(party):
+    if isinstance(party, dict):
+        return party.get("name") or "Unknown Party"
+    return str(party)
+
+
 def generate_tally_xml(invoice: dict, output_path: str):
     envelope = Element("ENVELOPE")
 
@@ -23,7 +29,8 @@ def generate_tally_xml(invoice: dict, output_path: str):
     # --- BASIC FIELDS ---
     SubElement(voucher, "DATE").text = invoice["invoice_date"]
     SubElement(voucher, "VOUCHERNUMBER").text = invoice["invoice_number"]
-    SubElement(voucher, "PARTYLEDGERNAME").text = invoice["buyer"]
+    buyer_ledger = _party_ledger_name(invoice.get("buyer"))
+    SubElement(voucher, "PARTYLEDGERNAME").text = buyer_ledger
     SubElement(voucher, "NARRATION").text = "Imported from Invoice AI"
 
     # --- SALES LINE ITEMS ---
@@ -45,7 +52,7 @@ def generate_tally_xml(invoice: dict, output_path: str):
     # --- PARTY LEDGER (RECEIVABLE) ---
     party_entry = SubElement(voucher, "ALLLEDGERENTRIES.LIST")
 
-    SubElement(party_entry, "LEDGERNAME").text = invoice["buyer"]
+    SubElement(party_entry, "LEDGERNAME").text = buyer_ledger
     SubElement(party_entry, "ISDEEMEDPOSITIVE").text = "Yes"
     SubElement(party_entry, "AMOUNT").text = str(invoice["total"])
 
