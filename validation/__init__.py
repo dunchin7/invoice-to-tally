@@ -5,6 +5,12 @@ from validation.pipeline import (
     run_normalization_pipeline,
     to_mutable_invoice,
 )
+from validation.pre_import import (
+    MappingIssue,
+    MappingRuleStore,
+    PreImportResolver,
+    ResolutionReport,
+)
 
 __all__ = [
     "validate_invoice",
@@ -12,4 +18,8 @@ __all__ = [
     "ValidationReport",
     "run_normalization_pipeline",
     "to_mutable_invoice",
+    "MappingIssue",
+    "MappingRuleStore",
+    "PreImportResolver",
+    "ResolutionReport",
 ]

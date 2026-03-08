@@ -1,0 +1,22 @@
+{
+  "global": {
+    "party": {
+      "acme corp": "ACME CORPORATION",
+      "walk in customer": "CASH"
+    },
+    "ledger": {
+      "output gst": "Output CGST",
+      "sales tax": "Output SGST"
+    },
+    "stock_item": {
+      "widget a": "WIDGET-A"
+    }
+  },
+  "tenants": {
+    "default": {
+      "party": {},
+      "ledger": {},
+      "stock_item": {}
+    }
+  }
+}

@@ -60,6 +60,29 @@ invoice-to-tally/
 
 ---
 
+### Pre-import reconciliation with Tally master data
+
+Before XML generation, the CLI can now reconcile extracted entities against Tally master data:
+
+* Fetches **party/ledger/stock-item** masters from Tally HTTP API and caches them locally (`outputs/tally_master_cache.json`).
+* Resolves extracted buyer/line-item names using:
+  1) tenant/global mapping rules (`validation/config/mapping_rules.json`),
+  2) exact master-name match,
+  3) alias match.
+* Applies configurable fallback policies per entity (`auto_create`, `reject`, `manual_review`).
+* Emits actionable reconciliation issues with field names and top suggestions in `outputs/preimport_report.json`.
+* Supports tenant-specific rules from JSON and optional SQLite (`--mapping-rules-db`).
+
+Useful flags:
+
+```bash
+python main.py --input samples/sample_invoice.pdf \
+  --tenant-id default \
+  --party-fallback manual_review \
+  --stock-fallback reject \
+  --mapping-rules-file validation/config/mapping_rules.json
+```
+
 ## ⚙️ Prerequisites
 
 ### 1) Python
