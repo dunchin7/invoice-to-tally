@@ -2,8 +2,9 @@ import argparse
 import json
 import os
 
-from llm.extractor import extract_invoice_fields
 from ocr.ocr_engine import extract_text
+from llm.extractor import extract_structured_invoice
+from validation.normalizer import validate_invoice
 from tally.xml_generator import generate_tally_xml
 from validation.pipeline import run_normalization_pipeline, to_mutable_invoice
 
@@ -43,34 +44,24 @@ def main():
     raw_text = extract_text(args.input)
 
     print("[*] Sending text to Gemini for field extraction...")
-    invoice_data = extract_invoice_fields(raw_text)
+    extraction_result = extract_structured_invoice(raw_text)
 
-    print("[*] Running normalization + validation pipeline...")
-    result = run_normalization_pipeline(
-        invoice_data,
-        allow_critical_override=args.allow_accounting_override,
-    )
+    if extraction_result.get("status") != "success":
+        diagnostics = extraction_result.get("diagnostics", {})
+        raise RuntimeError(
+            f"Invoice extraction failed: {extraction_result.get('error', {}).get('message', 'Unknown error')} | diagnostics={diagnostics}"
+        )
 
-    normalized_payload = to_mutable_invoice(result.normalized)
+    print("[*] Validating extracted invoice...")
+    validated = validate_invoice(extraction_result["data"])
+    extraction_result["data"] = validated
 
     # ---- SAVE JSON ----
     with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(normalized_payload, f, indent=2)
-
-    with open(args.report_output, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "warnings": list(result.report.warnings),
-                "errors": list(result.report.errors),
-                "confidence_flags": dict(result.report.confidence_flags),
-                "critical_failure": result.report.critical_failure,
-            },
-            f,
-            indent=2,
-        )
+        json.dump(extraction_result, f, indent=2)
 
     print(f"[+] Structured invoice saved to: {args.output}")
-    print(f"[+] Validation report saved to: {args.report_output}")
+    print(f"[*] Extraction confidence: {extraction_result.get('confidence', {}).get('overall', 0)}")
 
     # ---- GENERATE TALLY XML ----
     generate_tally_xml(normalized_payload, args.tally_output)
