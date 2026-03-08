@@ -297,3 +297,60 @@ This is a working proof-of-work prototype demonstrating:
 * Accounting-system XML generation
 
 **Ready for demo and iteration.**
+
+---
+
+## 📊 Evaluation Workflow (Field + Document Quality)
+
+Use the benchmark dataset and evaluator to measure extraction quality over time.
+
+### Benchmark folders
+
+- `datasets/source_docs/`: source invoice files by vendor/template (scaffold kept via `.gitkeep`; avoid committing large binaries).
+- `datasets/ground_truth/`: labeled JSON ground truth.
+- `evaluation/run_eval.py`: evaluation runner.
+- `evaluation/reports/`: generated CSV/JSON reports.
+
+### Run evaluation
+
+```bash
+python evaluation/run_eval.py \
+  --ground-truth-dir datasets/ground_truth \
+  --predictions-dir outputs \
+  --report-dir evaluation/reports
+```
+
+### Metrics included
+
+- Field-level precision / recall / F1 for key fields (`invoice_number`, `invoice_date`, `seller`, `buyer`, `currency`, `subtotal`, `tax`, `total`).
+- Line-item matching precision / recall / F1 based on description + quantity + unit price + total price.
+- Document-level quality:
+  - exact document match rate
+  - critical-field pass rate
+
+### Release readiness gates
+
+By default the evaluator fails (`exit code 1`) when either gate fails:
+
+- Any critical field (`invoice_number`, `invoice_date`, `total`) has F1 below `0.95`.
+- Critical document pass rate is below `0.90`.
+
+Override thresholds if required:
+
+```bash
+python evaluation/run_eval.py \
+  --critical-f1-threshold 0.98 \
+  --critical-doc-pass-threshold 0.95
+```
+
+### Report outputs for regression tracking
+
+- `evaluation/reports/evaluation_summary.json`: full run summary + gate status.
+- `evaluation/reports/evaluation_fields.csv`: tabular metrics for plotting/tracking.
+
+### Adding new invoice templates/vendors to benchmark
+
+1. Add the source invoice under `datasets/source_docs/`.
+2. Create a matching labeled JSON in `datasets/ground_truth/` with the same file stem.
+3. Generate or collect prediction JSON in your predictions folder with the same stem.
+4. Run evaluator and inspect release gates + metrics trend in saved reports.
