@@ -1,31 +1,24 @@
 import argparse
 import json
-import os
 
-from ocr.ocr_engine import extract_text
-from llm.extractor import extract_structured_invoice
-from validation.normalizer import validate_invoice
-from tally.xml_generator import generate_tally_xml
-from validation.pipeline import run_normalization_pipeline, to_mutable_invoice
+from service.orchestrator import InvoiceOrchestrator
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Invoice OCR → LLM → Structured JSON → Tally XML")
-    parser.add_argument("--input", required=True, help="Path to invoice PDF or image")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Invoice OCR → LLM → Validation → Orchestrated Tally posting"
+    )
+    parser.add_argument("--input", required=True, help="Path to invoice PDF/image/document")
     parser.add_argument(
-        "--output",
-        default="outputs/invoice_structured.json",
-        help="Path to save structured invoice JSON",
+        "--orchestration-output",
+        default="outputs/orchestration",
+        help="Directory used by the orchestration service for job state and artifacts",
     )
     parser.add_argument(
-        "--tally-output",
-        default="outputs/tally_invoice.xml",
-        help="Path to save Tally XML file",
-    )
-    parser.add_argument(
-        "--report-output",
-        default="outputs/validation_report.json",
-        help="Path to save validation report JSON",
+        "--low-confidence-threshold",
+        default=0.8,
+        type=float,
+        help="Invoices below this extraction confidence are routed to manual review",
     )
     parser.add_argument(
         "--allow-accounting-override",
@@ -35,41 +28,26 @@ def main():
             "(subtotal/tax/total or line-item rollup mismatches)."
         ),
     )
+    parser.add_argument(
+        "--operator",
+        default="system",
+        help="Operator identifier for audit logs when manually invoking this command",
+    )
 
     args = parser.parse_args()
 
-    os.makedirs("outputs", exist_ok=True)
+    orchestrator = InvoiceOrchestrator(
+        output_dir=args.orchestration_output,
+        low_confidence_threshold=args.low_confidence_threshold,
+    )
 
-    print("[*] Ingesting invoice and extracting text...")
-    try:
-        raw_text = route_extraction(args.input)
-    except IngestionError as exc:
-        raise SystemExit(f"[!] Ingestion failed: {exc}")
+    result = orchestrator.process_invoice(
+        input_path=args.input,
+        operator=args.operator,
+        allow_accounting_override=args.allow_accounting_override,
+    )
 
-    print("[*] Sending text to Gemini for field extraction...")
-    extraction_result = extract_structured_invoice(raw_text)
-
-    if extraction_result.get("status") != "success":
-        diagnostics = extraction_result.get("diagnostics", {})
-        raise RuntimeError(
-            f"Invoice extraction failed: {extraction_result.get('error', {}).get('message', 'Unknown error')} | diagnostics={diagnostics}"
-        )
-
-    print("[*] Validating extracted invoice...")
-    validated = validate_invoice(extraction_result["data"])
-    extraction_result["data"] = validated
-
-    # ---- SAVE JSON ----
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(extraction_result, f, indent=2)
-
-    print(f"[+] Structured invoice saved to: {args.output}")
-    print(f"[*] Extraction confidence: {extraction_result.get('confidence', {}).get('overall', 0)}")
-
-    # ---- GENERATE TALLY XML ----
-    generate_tally_xml(normalized_payload, args.tally_output)
-
-    print(f"[+] Tally XML saved to: {args.tally_output}")
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
