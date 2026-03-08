@@ -28,6 +28,7 @@ Invoice (PDF/Image)
 invoice-to-tally/
 │
 ├── main.py                 # CLI entrypoint
+├── settings.py             # Centralized env/config settings
 ├── requirements.txt        # Python dependencies
 ├── .env                    # Gemini API key (not committed)
 ├── .gitignore
@@ -94,6 +95,80 @@ C:\poppler-25.12.0\Library\bin
 ```
 
 > ⚠️ The Poppler path is hard-wired in `ocr/ocr_engine.py` for reliability.
+### 2) OCR binaries
+
+You need:
+
+* **Tesseract OCR** (`tesseract` executable)
+* **Poppler** (`pdftoppm` executable, used for PDF conversion)
+
+Install references:
+
+* Tesseract: <https://github.com/UB-Mannheim/tesseract/wiki>
+* Poppler Windows builds: <https://github.com/oschwartz10612/poppler-windows/releases>
+
+### 3) Configure OCR paths (optional but recommended)
+
+The app reads OCR executable settings from environment variables:
+
+* `TESSERACT_CMD` → full path to `tesseract` executable
+* `POPPLER_PATH` → folder containing Poppler binaries (the folder that includes `pdftoppm`)
+
+If unset, the app uses system defaults (`PATH`).
+
+#### Linux / macOS examples
+
+```bash
+# Use system binaries from PATH (no extra config)
+python main.py --input samples/sample_invoice.pdf
+
+# Or explicitly set custom locations
+export TESSERACT_CMD=/usr/local/bin/tesseract
+export POPPLER_PATH=/usr/local/opt/poppler/bin
+python main.py --input samples/sample_invoice.pdf
+```
+
+#### Windows (PowerShell) examples
+
+```powershell
+# Use explicit install locations
+$env:TESSERACT_CMD = "C:\Program Files\Tesseract-OCR\tesseract.exe"
+$env:POPPLER_PATH = "C:\poppler-25.12.0\Library\bin"
+python main.py --input samples/sample_invoice.pdf
+```
+
+#### Docker-friendly example
+
+```dockerfile
+ENV TESSERACT_CMD=/usr/bin/tesseract
+ENV POPPLER_PATH=/usr/bin
+```
+
+> Runtime validation is input-aware: image OCR requires **Tesseract**; PDF OCR requires **Tesseract + Poppler**. Errors clearly list what is missing.
+
+
+### Why OCR binaries are required (and accuracy impact)
+
+This project uses Python wrappers (`pytesseract`, `pdf2image`) around native OCR tools:
+
+* `pytesseract` **does not include OCR itself**; it calls the external `tesseract` binary.
+* `pdf2image` converts PDFs via Poppler tools (notably `pdftoppm`) before OCR.
+
+For best extraction quality, use current stable Tesseract/Poppler builds and clear PDF/image inputs (higher DPI, non-blurry scans).
+
+### Can we include OCR binaries in this repo?
+
+Short answer: **not recommended**.
+
+* Binary artifacts are large and will bloat git history.
+* Cross-platform binaries differ (Linux/macOS/Windows), so one repo copy will not fit all environments.
+* Packaging and redistribution/licensing obligations are easier to manage via OS packages or Docker base images.
+* Security and patching are better handled by package managers or maintained container images.
+
+Recommended approach:
+
+* Install OCR binaries at deploy/runtime layer (host VM, CI image, or Docker image).
+* Pass locations with `TESSERACT_CMD` / `POPPLER_PATH` when paths are non-standard.
 
 ---
 
@@ -242,6 +317,7 @@ Example:
 ## 🧠 Architecture Notes
 
 * **OCR Layer:** Tesseract + Poppler
+* **OCR Layer:** Tesseract + Poppler (env-driven config)
 * **LLM Layer:** Gemini via `google-genai`
 * **Normalization:** Fixes inconsistent field names, numeric strings, nested objects
 * **Validation:** JSON Schema ensures correctness
@@ -297,3 +373,60 @@ This is a working proof-of-work prototype demonstrating:
 * Accounting-system XML generation
 
 **Ready for demo and iteration.**
+
+---
+
+## 📊 Evaluation Workflow (Field + Document Quality)
+
+Use the benchmark dataset and evaluator to measure extraction quality over time.
+
+### Benchmark folders
+
+- `datasets/source_docs/`: source invoice files by vendor/template (scaffold kept via `.gitkeep`; avoid committing large binaries).
+- `datasets/ground_truth/`: labeled JSON ground truth.
+- `evaluation/run_eval.py`: evaluation runner.
+- `evaluation/reports/`: generated CSV/JSON reports.
+
+### Run evaluation
+
+```bash
+python evaluation/run_eval.py \
+  --ground-truth-dir datasets/ground_truth \
+  --predictions-dir outputs \
+  --report-dir evaluation/reports
+```
+
+### Metrics included
+
+- Field-level precision / recall / F1 for key fields (`invoice_number`, `invoice_date`, `seller`, `buyer`, `currency`, `subtotal`, `tax`, `total`).
+- Line-item matching precision / recall / F1 based on description + quantity + unit price + total price.
+- Document-level quality:
+  - exact document match rate
+  - critical-field pass rate
+
+### Release readiness gates
+
+By default the evaluator fails (`exit code 1`) when either gate fails:
+
+- Any critical field (`invoice_number`, `invoice_date`, `total`) has F1 below `0.95`.
+- Critical document pass rate is below `0.90`.
+
+Override thresholds if required:
+
+```bash
+python evaluation/run_eval.py \
+  --critical-f1-threshold 0.98 \
+  --critical-doc-pass-threshold 0.95
+```
+
+### Report outputs for regression tracking
+
+- `evaluation/reports/evaluation_summary.json`: full run summary + gate status.
+- `evaluation/reports/evaluation_fields.csv`: tabular metrics for plotting/tracking.
+
+### Adding new invoice templates/vendors to benchmark
+
+1. Add the source invoice under `datasets/source_docs/`.
+2. Create a matching labeled JSON in `datasets/ground_truth/` with the same file stem.
+3. Generate or collect prediction JSON in your predictions folder with the same stem.
+4. Run evaluator and inspect release gates + metrics trend in saved reports.

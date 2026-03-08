@@ -1,29 +1,74 @@
 invoice_schema = {
     "type": "object",
     "properties": {
-        "invoice_number": {"type": "string"},
-        "invoice_date": {"type": "string"},
-        "seller": {"type": "string"},
-        "buyer": {"type": "string"},
-        "currency": {"type": "string"},
+        "schema_version": {"type": "string", "const": "2.0"},
+        "invoice_number": {"type": "string", "minLength": 1},
+        "invoice_type": {
+            "type": ["string", "null"],
+            "enum": [
+                "tax_invoice",
+                "credit_note",
+                "debit_note",
+                "proforma_invoice",
+                "receipt",
+                None,
+            ],
+        },
+        "invoice_date": {"type": "string", "pattern": r"^\d{4}-\d{2}-\d{2}$"},
+        "due_date": {"type": ["string", "null"], "pattern": r"^\d{4}-\d{2}-\d{2}$"},
+        "po_number": {"type": ["string", "null"]},
+        "place_of_supply": {"type": ["string", "null"]},
+        "reverse_charge": {"type": ["boolean", "null"]},
+        "transport": {
+            "type": ["object", "null"],
+            "properties": {
+                "transport_mode": {"type": ["string", "null"]},
+                "transporter_name": {"type": ["string", "null"]},
+                "vehicle_number": {"type": ["string", "null"]},
+                "lr_number": {"type": ["string", "null"]},
+                "eway_bill_number": {"type": ["string", "null"]},
+            },
+            "additionalProperties": False,
+        },
+        "seller": {"$ref": "#/definitions/party"},
+        "buyer": {"$ref": "#/definitions/party"},
+        "currency": {"type": "string", "minLength": 1},
         "line_items": {
             "type": "array",
+            "minItems": 1,
             "items": {
                 "type": "object",
                 "properties": {
-                    "description": {"type": "string"},
-                    "quantity": {"type": "number"},
-                    "unit_price": {"type": "number"},
-                    "total_price": {"type": "number"}
+                    "description": {"type": "string", "minLength": 1},
+                    "hsn_sac": {"type": ["string", "null"]},
+                    "quantity": {"type": ["number", "null"]},
+                    "unit": {"type": ["string", "null"]},
+                    "uom": {"type": ["string", "null"]},
+                    "unit_price": {"type": ["number", "null"]},
+                    "discount_rate": {"type": ["number", "null"]},
+                    "discount_amount": {"type": ["number", "null"]},
+                    "taxable_value": {"type": ["number", "null"]},
+                    "cgst_rate": {"type": ["number", "null"]},
+                    "sgst_rate": {"type": ["number", "null"]},
+                    "igst_rate": {"type": ["number", "null"]},
+                    "cess_rate": {"type": ["number", "null"]},
+                    "cgst_amount": {"type": ["number", "null"]},
+                    "sgst_amount": {"type": ["number", "null"]},
+                    "igst_amount": {"type": ["number", "null"]},
+                    "cess_amount": {"type": ["number", "null"]},
+                    "tax_amount": {"type": ["number", "null"]},
+                    "total_price": {"type": ["number", "null"]},
                 },
-                "required": ["description", "quantity", "unit_price", "total_price"]
-            }
+                "required": ["description", "quantity", "unit_price", "total_price"],
+                "additionalProperties": False,
+            },
         },
-        "subtotal": {"type": "number"},
-        "tax": {"type": "number"},
-        "total": {"type": "number"}
+        "subtotal": {"type": ["number", "null"]},
+        "tax": {"type": ["number", "null"]},
+        "total": {"type": ["number", "null"]},
     },
     "required": [
+        "schema_version",
         "invoice_number",
         "invoice_date",
         "seller",
@@ -32,6 +77,38 @@ invoice_schema = {
         "line_items",
         "subtotal",
         "tax",
-        "total"
-    ]
+        "total",
+    ],
+    "definitions": {
+        "party": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "minLength": 1},
+                "gstin": {
+                    "type": ["string", "null"],
+                    "pattern": r"^([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9])?$",
+                },
+                "pan": {
+                    "type": ["string", "null"],
+                    "pattern": r"^([A-Z]{5}[0-9]{4}[A-Z])?$",
+                },
+                "address": {
+                    "type": "object",
+                    "properties": {
+                        "line1": {"type": ["string", "null"]},
+                        "line2": {"type": ["string", "null"]},
+                        "city": {"type": ["string", "null"]},
+                        "state": {"type": ["string", "null"]},
+                        "postal_code": {"type": ["string", "null"]},
+                        "country": {"type": ["string", "null"]},
+                    },
+                    "required": ["line1", "line2", "city", "state", "postal_code", "country"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["name", "gstin", "pan", "address"],
+            "additionalProperties": False,
+        }
+    },
+    "additionalProperties": False,
 }
