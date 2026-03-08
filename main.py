@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 
-from ocr.ocr_engine import extract_text
+from ingestion.router import IngestionError, route_extraction
 from llm.extractor import extract_invoice_fields
 from validation.normalizer import validate_invoice
 from tally.xml_generator import generate_tally_xml
@@ -26,8 +26,11 @@ def main():
 
     os.makedirs("outputs", exist_ok=True)
 
-    print("[*] Extracting text from invoice...")
-    raw_text = extract_text(args.input)
+    print("[*] Ingesting invoice and extracting text...")
+    try:
+        raw_text = route_extraction(args.input)
+    except IngestionError as exc:
+        raise SystemExit(f"[!] Ingestion failed: {exc}")
 
     print("[*] Sending text to Gemini for field extraction...")
     invoice_data = extract_invoice_fields(raw_text)
