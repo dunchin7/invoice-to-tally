@@ -1,33 +1,35 @@
 import argparse
 import json
-import os
 
 from ingestion.router import IngestionError, route_extraction
 from llm.extractor import extract_structured_invoice
 from tally.master_data import TallyMasterDataClient, load_master_data_from_file
 from tally.xml_generator import generate_tally_xml
 from validation.normalizer import validate_invoice
+from service.orchestrator import InvoiceOrchestrator
+from ingestion.router import IngestionError, route_extraction
+from settings import SETTINGS
+from tally.client import TallyClient, TallyClientConfig
+from tally.xml_generator import build_tally_xml, generate_tally_xml
 from validation.pipeline import run_normalization_pipeline, to_mutable_invoice
 from validation.pre_import import MappingRuleStore, PreImportResolver
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Invoice OCR → LLM → Structured JSON → Tally XML")
-    parser.add_argument("--input", required=True, help="Path to invoice PDF or image")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Invoice OCR → LLM → Validation → Orchestrated Tally posting"
+    )
+    parser.add_argument("--input", required=True, help="Path to invoice PDF/image/document")
     parser.add_argument(
-        "--output",
-        default="outputs/invoice_structured.json",
-        help="Path to save structured invoice JSON",
+        "--orchestration-output",
+        default="outputs/orchestration",
+        help="Directory used by the orchestration service for job state and artifacts",
     )
     parser.add_argument(
-        "--tally-output",
-        default="outputs/tally_invoice.xml",
-        help="Path to save Tally XML file",
-    )
-    parser.add_argument(
-        "--report-output",
-        default="outputs/validation_report.json",
-        help="Path to save validation report JSON",
+        "--low-confidence-threshold",
+        default=0.8,
+        type=float,
+        help="Invoices below this extraction confidence are routed to manual review",
     )
     parser.add_argument(
         "--preimport-report-output",
@@ -75,9 +77,31 @@ def main():
             "(subtotal/tax/total or line-item rollup mismatches)."
         ),
     )
+    parser.add_argument(
+        "--operator",
+        default="system",
+        help="Operator identifier for audit logs when manually invoking this command",
+        "--upload-to-tally",
+        action="store_true",
+        help="Upload the generated Tally XML to the configured Tally endpoint.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only prepare upload and print destination; do not send HTTP request.",
+    )
 
     args = parser.parse_args()
 
+    orchestrator = InvoiceOrchestrator(
+        output_dir=args.orchestration_output,
+        low_confidence_threshold=args.low_confidence_threshold,
+    )
+
+    result = orchestrator.process_invoice(
+        input_path=args.input,
+        operator=args.operator,
+        allow_accounting_override=args.allow_accounting_override,
     os.makedirs("outputs", exist_ok=True)
 
     print("[*] Ingesting invoice and extracting text...")
@@ -155,6 +179,64 @@ def main():
 
     generate_tally_xml(preimport_report.invoice, args.tally_output)
     print(f"[+] Tally XML saved to: {args.tally_output}")
+    print("[*] Normalizing and validating extracted invoice...")
+    normalization_result = run_normalization_pipeline(
+        extraction_result["data"],
+        allow_critical_override=args.allow_accounting_override,
+    )
+    normalized_payload = to_mutable_invoice(normalization_result.normalized)
+
+    extraction_result["data"] = normalized_payload
+    extraction_result["validation_report"] = {
+        "warnings": list(normalization_result.report.warnings),
+        "errors": list(normalization_result.report.errors),
+        "confidence_flags": dict(normalization_result.report.confidence_flags),
+        "critical_failure": normalization_result.report.critical_failure,
+    }
+
+    with open(args.output, "w", encoding="utf-8") as output_json:
+        json.dump(extraction_result, output_json, indent=2)
+
+    print(f"[+] Structured invoice saved to: {args.output}")
+
+    generate_tally_xml(
+        normalized_payload,
+        args.tally_output,
+        company=SETTINGS.tally_company,
+        voucher_type=SETTINGS.tally_voucher_type,
+        voucher_action=SETTINGS.tally_voucher_action,
+    )
+
+    print(json.dumps(result, indent=2))
+
+    if args.upload_to_tally:
+        xml_payload = build_tally_xml(
+            normalized_payload,
+            company=SETTINGS.tally_company,
+            voucher_type=SETTINGS.tally_voucher_type,
+            voucher_action=SETTINGS.tally_voucher_action,
+        )
+        client = TallyClient(
+            TallyClientConfig(
+                host=SETTINGS.tally_host,
+                port=SETTINGS.tally_port,
+                company=SETTINGS.tally_company,
+                timeout_seconds=SETTINGS.tally_timeout_seconds,
+                max_retries=SETTINGS.tally_max_retries,
+                retry_backoff_seconds=SETTINGS.tally_retry_backoff_seconds,
+            )
+        )
+
+        if args.dry_run:
+            print(f"[i] Dry run enabled. XML prepared for upload to {client.endpoint}")
+            return
+
+        print(f"[*] Uploading XML to Tally at {client.endpoint}...")
+        status = client.upload_xml(xml_payload)
+        if status.ok:
+            print(f"[+] {status.message}")
+        else:
+            raise SystemExit(f"[!] {status.message}")
 
 
 if __name__ == "__main__":

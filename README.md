@@ -169,6 +169,26 @@ ENV POPPLER_PATH=/usr/bin
 
 > Runtime validation is input-aware: image OCR requires **Tesseract**; PDF OCR requires **Tesseract + Poppler**. Errors clearly list what is missing.
 
+### 4) Configure Tally upload options (optional)
+
+Set these environment variables to enable direct upload to a running Tally instance:
+
+* `TALLY_HOST` (default: `localhost`)
+* `TALLY_PORT` (default: `9000`)
+* `TALLY_COMPANY` (optional company context for imports)
+* `TALLY_VOUCHER_TYPE` (default: `Sales`)
+* `TALLY_VOUCHER_ACTION` (default: `Create`)
+* `TALLY_TIMEOUT_SECONDS` (default: `15`)
+* `TALLY_MAX_RETRIES` (default: `3`)
+* `TALLY_RETRY_BACKOFF_SECONDS` (default: `1`)
+
+Use CLI flags to control upload behavior:
+
+```bash
+python main.py --input samples/sample_invoice.pdf --upload-to-tally
+python main.py --input samples/sample_invoice.pdf --upload-to-tally --dry-run
+```
+
 
 ### Why OCR binaries are required (and accuracy impact)
 
@@ -194,6 +214,33 @@ Recommended approach:
 * Pass locations with `TESSERACT_CMD` / `POPPLER_PATH` when paths are non-standard.
 
 ---
+
+
+## 🧭 Orchestration Layer
+
+The project now includes a service orchestrator (`service/orchestrator.py`) that tracks each invoice as a job through:
+
+- `ingested`
+- `extracted`
+- `validated`
+- `review_required`
+- `posted`
+- `failed`
+
+For every job, the orchestrator persists artifacts under `outputs/orchestration/<job_id>/`:
+
+- `raw_ocr_text.txt`
+- `extracted_invoice.json`
+- `normalized_invoice.json`
+- `validation_report.json`
+- `tally_invoice.xml` (when posted)
+- `upload_response.json`
+- `job_record.json` (state + audit trail)
+
+It also writes:
+
+- `outputs/orchestration/manual_review_queue.jsonl` for low-confidence or validation-failed invoices.
+- `outputs/orchestration/idempotency_store.json` to prevent duplicate Tally posting for the same invoice.
 
 ## 🔑 Gemini API Key Setup
 
