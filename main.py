@@ -40,8 +40,11 @@ def main():
 
     os.makedirs("outputs", exist_ok=True)
 
-    print("[*] Extracting text from invoice...")
-    raw_text = extract_text(args.input)
+    print("[*] Ingesting invoice and extracting text...")
+    try:
+        raw_text = route_extraction(args.input)
+    except IngestionError as exc:
+        raise SystemExit(f"[!] Ingestion failed: {exc}")
 
     print("[*] Sending text to Gemini for field extraction...")
     extraction_result = extract_structured_invoice(raw_text)
