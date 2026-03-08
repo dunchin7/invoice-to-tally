@@ -1,7 +1,7 @@
 import argparse
 import json
-import os
 
+from service.orchestrator import InvoiceOrchestrator
 from ingestion.router import IngestionError, route_extraction
 from llm.extractor import extract_structured_invoice
 from settings import SETTINGS
@@ -10,18 +10,21 @@ from tally.xml_generator import build_tally_xml, generate_tally_xml
 from validation.pipeline import run_normalization_pipeline, to_mutable_invoice
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Invoice OCR → LLM → Structured JSON → Tally XML")
-    parser.add_argument("--input", required=True, help="Path to invoice PDF or image")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Invoice OCR → LLM → Validation → Orchestrated Tally posting"
+    )
+    parser.add_argument("--input", required=True, help="Path to invoice PDF/image/document")
     parser.add_argument(
-        "--output",
-        default="outputs/invoice_structured.json",
-        help="Path to save structured invoice JSON",
+        "--orchestration-output",
+        default="outputs/orchestration",
+        help="Directory used by the orchestration service for job state and artifacts",
     )
     parser.add_argument(
-        "--tally-output",
-        default="outputs/tally_invoice.xml",
-        help="Path to save Tally XML file",
+        "--low-confidence-threshold",
+        default=0.8,
+        type=float,
+        help="Invoices below this extraction confidence are routed to manual review",
     )
     parser.add_argument(
         "--allow-accounting-override",
@@ -32,6 +35,9 @@ def main():
         ),
     )
     parser.add_argument(
+        "--operator",
+        default="system",
+        help="Operator identifier for audit logs when manually invoking this command",
         "--upload-to-tally",
         action="store_true",
         help="Upload the generated Tally XML to the configured Tally endpoint.",
@@ -44,6 +50,15 @@ def main():
 
     args = parser.parse_args()
 
+    orchestrator = InvoiceOrchestrator(
+        output_dir=args.orchestration_output,
+        low_confidence_threshold=args.low_confidence_threshold,
+    )
+
+    result = orchestrator.process_invoice(
+        input_path=args.input,
+        operator=args.operator,
+        allow_accounting_override=args.allow_accounting_override,
     os.makedirs("outputs", exist_ok=True)
 
     print("[*] Ingesting invoice and extracting text...")
@@ -89,7 +104,7 @@ def main():
         voucher_action=SETTINGS.tally_voucher_action,
     )
 
-    print(f"[+] Tally XML saved to: {args.tally_output}")
+    print(json.dumps(result, indent=2))
 
     if args.upload_to_tally:
         xml_payload = build_tally_xml(

@@ -192,6 +192,33 @@ Recommended approach:
 
 ---
 
+
+## 🧭 Orchestration Layer
+
+The project now includes a service orchestrator (`service/orchestrator.py`) that tracks each invoice as a job through:
+
+- `ingested`
+- `extracted`
+- `validated`
+- `review_required`
+- `posted`
+- `failed`
+
+For every job, the orchestrator persists artifacts under `outputs/orchestration/<job_id>/`:
+
+- `raw_ocr_text.txt`
+- `extracted_invoice.json`
+- `normalized_invoice.json`
+- `validation_report.json`
+- `tally_invoice.xml` (when posted)
+- `upload_response.json`
+- `job_record.json` (state + audit trail)
+
+It also writes:
+
+- `outputs/orchestration/manual_review_queue.jsonl` for low-confidence or validation-failed invoices.
+- `outputs/orchestration/idempotency_store.json` to prevent duplicate Tally posting for the same invoice.
+
 ## 🔑 Gemini API Key Setup
 
 1. Go to: [https://makersuite.google.com/app/apikey](https://makersuite.google.com/app/apikey)
