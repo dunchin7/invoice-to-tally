@@ -3,7 +3,7 @@ import json
 import os
 
 from ocr.ocr_engine import extract_text
-from llm.extractor import extract_invoice_fields
+from llm.extractor import extract_structured_invoice
 from validation.normalizer import validate_invoice
 from tally.xml_generator import generate_tally_xml
 
@@ -30,16 +30,24 @@ def main():
     raw_text = extract_text(args.input)
 
     print("[*] Sending text to Gemini for field extraction...")
-    invoice_data = extract_invoice_fields(raw_text)
+    extraction_result = extract_structured_invoice(raw_text)
+
+    if extraction_result.get("status") != "success":
+        diagnostics = extraction_result.get("diagnostics", {})
+        raise RuntimeError(
+            f"Invoice extraction failed: {extraction_result.get('error', {}).get('message', 'Unknown error')} | diagnostics={diagnostics}"
+        )
 
     print("[*] Validating extracted invoice...")
-    validated = validate_invoice(invoice_data)
+    validated = validate_invoice(extraction_result["data"])
+    extraction_result["data"] = validated
 
     # ---- SAVE JSON ----
     with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(validated, f, indent=2)
+        json.dump(extraction_result, f, indent=2)
 
     print(f"[+] Structured invoice saved to: {args.output}")
+    print(f"[*] Extraction confidence: {extraction_result.get('confidence', {}).get('overall', 0)}")
 
     # ---- GENERATE TALLY XML ----
     generate_tally_xml(validated, args.tally_output)
