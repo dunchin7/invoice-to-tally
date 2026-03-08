@@ -146,6 +146,26 @@ ENV POPPLER_PATH=/usr/bin
 
 > Runtime validation is input-aware: image OCR requires **Tesseract**; PDF OCR requires **Tesseract + Poppler**. Errors clearly list what is missing.
 
+### 4) Configure Tally upload options (optional)
+
+Set these environment variables to enable direct upload to a running Tally instance:
+
+* `TALLY_HOST` (default: `localhost`)
+* `TALLY_PORT` (default: `9000`)
+* `TALLY_COMPANY` (optional company context for imports)
+* `TALLY_VOUCHER_TYPE` (default: `Sales`)
+* `TALLY_VOUCHER_ACTION` (default: `Create`)
+* `TALLY_TIMEOUT_SECONDS` (default: `15`)
+* `TALLY_MAX_RETRIES` (default: `3`)
+* `TALLY_RETRY_BACKOFF_SECONDS` (default: `1`)
+
+Use CLI flags to control upload behavior:
+
+```bash
+python main.py --input samples/sample_invoice.pdf --upload-to-tally
+python main.py --input samples/sample_invoice.pdf --upload-to-tally --dry-run
+```
+
 
 ### Why OCR binaries are required (and accuracy impact)
 
