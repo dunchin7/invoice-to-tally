@@ -14,8 +14,8 @@ This tool takes an invoice (PDF or image), extracts text using OCR, uses a Large
 Invoice (PDF/Image)
    → OCR (Tesseract + Poppler)
    → Gemini LLM (field extraction)
-   → Normalizer (cleans LLM output)
-   → JSON Schema Validation
+   → Staged Normalization Pipeline (auditable transforms)
+   → JSON Schema + Cross-field Validation
    → Structured JSON
    → Tally XML
 ```
@@ -43,7 +43,8 @@ invoice-to-tally/
 │
 ├── validation/
 │   ├── __init__.py
-│   └── normalizer.py       # Output normalization + schema validation
+│   ├── pipeline.py         # Staged, auditable normalization + validation
+│   └── normalizer.py       # Backward-compatible wrapper
 │
 ├── tally/
 │   ├── __init__.py
@@ -151,6 +152,27 @@ python main.py --input samples/sample_invoice.pdf
 
 ---
 
+
+### Validation behavior
+
+The pipeline now emits a validation report (`warnings`, `errors`, and `confidence_flags`) and performs critical accounting checks:
+
+- `subtotal + tax ~= total`
+- Sum of line item totals ~= `subtotal`
+
+By default, critical mismatches fail closed. To explicitly override this behavior, run:
+
+```
+python main.py --input samples/sample_invoice.pdf --allow-accounting-override
+```
+
+A machine-readable validation report is written by default to:
+
+```
+outputs/validation_report.json
+```
+
+---
 ## 📄 Output Files
 
 ### 1) Structured JSON
