@@ -1,9 +1,10 @@
 import re
 from datetime import datetime
 
-from jsonschema import validate
+from jsonschema import ValidationError, validate
 
 from schema.invoice_schema import invoice_schema
+from validation.errors import SchemaValidationError
 
 
 DATE_FORMATS = (
@@ -267,7 +268,11 @@ def validate_invoice(data: dict) -> dict:
 
     try:
         validate(instance=normalized, schema=invoice_schema)
-    except Exception as e:
-        raise ValueError(f"Invoice JSON validation failed: {e.message}") from e
+    except ValidationError as exc:
+        field = ".".join(str(part) for part in exc.absolute_path) or "invoice"
+        raise SchemaValidationError(
+            f"Invoice JSON validation failed: {exc.message}",
+            context={"field": field, "expected": exc.validator_value, "actual": exc.instance},
+        ) from exc
 
     return normalized
