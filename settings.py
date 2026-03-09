@@ -1,3 +1,4 @@
+import json
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -9,6 +10,11 @@ class Settings:
 
     tesseract_cmd: Optional[str] = None
     poppler_path: Optional[str] = None
+    ocr_language: Optional[str] = None
+    ocr_tenant_language_overrides: dict[str, str] | None = None
+    ocr_preprocess_deskew: bool = False
+    ocr_preprocess_binarization: bool = False
+    ocr_preprocess_contrast_enhancement: bool = False
     tally_host: str = "localhost"
     tally_port: int = 9000
     tally_company: Optional[str] = None
@@ -39,11 +45,36 @@ def _parse_float(name: str, default: float) -> float:
         return default
 
 
+def _parse_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_json_mapping(name: str) -> dict[str, str]:
+    raw = os.getenv(name)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(key): str(value) for key, value in parsed.items() if value}
+
+
 def load_settings() -> Settings:
     """Load runtime configuration from environment variables."""
     return Settings(
         tesseract_cmd=os.getenv("TESSERACT_CMD") or None,
         poppler_path=os.getenv("POPPLER_PATH") or None,
+        ocr_language=os.getenv("OCR_LANGUAGE") or None,
+        ocr_tenant_language_overrides=_parse_json_mapping("OCR_TENANT_LANGUAGE_OVERRIDES"),
+        ocr_preprocess_deskew=_parse_bool("OCR_PREPROCESS_DESKEW"),
+        ocr_preprocess_binarization=_parse_bool("OCR_PREPROCESS_BINARIZATION"),
+        ocr_preprocess_contrast_enhancement=_parse_bool("OCR_PREPROCESS_CONTRAST_ENHANCEMENT"),
         tally_host=os.getenv("TALLY_HOST", "localhost"),
         tally_port=_parse_int("TALLY_PORT", 9000),
         tally_company=os.getenv("TALLY_COMPANY") or None,

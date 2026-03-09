@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 
 from service.orchestrator import InvoiceJobState, InvoiceOrchestrator
 from tally.client import TallyUploadStatus
@@ -64,7 +65,7 @@ def _patch_pipeline(monkeypatch, *, confidence=0.95, blocking=False):
         "line_items": [],
     }
 
-    monkeypatch.setattr("service.orchestrator.route_extraction", lambda _p: "raw text")
+    monkeypatch.setattr("service.orchestrator.route_extraction_with_diagnostics", lambda _p, tenant_id="default": ("raw text", {"source": "ocr", "preprocessing_steps": [], "language": None}))
     monkeypatch.setattr(
         "service.orchestrator.extract_structured_invoice",
         lambda _t: {"status": "success", "data": normalized, "confidence": {"overall": confidence}},
@@ -92,6 +93,7 @@ def test_blocking_validation_routes_to_manual_review(tmp_path, monkeypatch):
     result = orchestrator.process_invoice(input_path="invoice.pdf", master_data_file="master.json")
 
     assert result["state"] == InvoiceJobState.REVIEW_REQUIRED.value
+    assert "ocr_diagnostics" in result["artifacts"]
     assert result["review_queue_entry"]["reason"] == "validation_failed"
     assert "generated_xml" not in result["artifacts"]
 

@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from typing import Any, Dict
 from uuid import uuid4
 
-from ingestion.router import IngestionError, route_extraction
+from ingestion.router import IngestionError, route_extraction_with_diagnostics
 from llm.extractor import extract_structured_invoice
 from tally.master_data import TallyMasterDataClient, load_master_data_from_file
 from tally.client import TallyClient, TallyClientConfig, TallyUploadStatus
@@ -105,11 +105,14 @@ class InvoiceOrchestrator:
 
         try:
             transition(InvoiceJobState.INGESTED, "operator:submitted_invoice", {"input_path": str(input_path)})
-            raw_text = route_extraction(input_path)
+            raw_text, ocr_diagnostics = route_extraction_with_diagnostics(input_path, tenant_id=tenant_id)
             raw_text_path = job_path / "raw_ocr_text.txt"
             raw_text_path.write_text(raw_text, encoding="utf-8")
             record["artifacts"]["raw_ocr_text"] = str(raw_text_path)
-            transition(InvoiceJobState.INGESTED, "system:invoice_ingested")
+            ocr_diagnostics_path = job_path / "ocr_diagnostics.json"
+            self._write_json(ocr_diagnostics_path, ocr_diagnostics)
+            record["artifacts"]["ocr_diagnostics"] = str(ocr_diagnostics_path)
+            transition(InvoiceJobState.INGESTED, "system:invoice_ingested", {"ocr_diagnostics": ocr_diagnostics})
 
             extraction_result = extract_structured_invoice(raw_text)
             if extraction_result.get("status") != "success":
