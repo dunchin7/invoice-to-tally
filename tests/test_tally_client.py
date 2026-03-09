@@ -28,11 +28,29 @@ class TallyClientTests(unittest.TestCase):
         self.assertFalse(status.ok)
         self.assertIn("Ledger not found", status.line_errors)
 
+    def test_parse_response_without_import_result_is_failure(self):
+        xml = """
+        <html><body><h1>401 Unauthorized</h1></body></html>
+        """
+        status = parse_tally_response(xml, endpoint="http://localhost:9000")
+        self.assertFalse(status.ok)
+        self.assertIn("missing IMPORTRESULT", status.message)
+
+    def test_parse_response_with_missing_counters_is_failure(self):
+        xml = """
+        <ENVELOPE><BODY><DATA><IMPORTRESULT>
+        <CREATED>1</CREATED><ALTERED>0</ALTERED>
+        </IMPORTRESULT></DATA></BODY></ENVELOPE>
+        """
+        status = parse_tally_response(xml, endpoint="http://localhost:9000")
+        self.assertFalse(status.ok)
+        self.assertIn("missing or invalid IMPORTRESULT counters", status.message)
+
     @patch("tally.client.time.sleep")
     @patch("tally.client.requests.post")
     def test_retries_transient_network_failures(self, post_mock: Mock, _sleep_mock: Mock):
         response = Mock()
-        response.text = "<ENVELOPE><CREATED>1</CREATED><ERRORS>0</ERRORS></ENVELOPE>"
+        response.text = "<ENVELOPE><BODY><DATA><IMPORTRESULT><CREATED>1</CREATED><ALTERED>0</ALTERED><IGNORED>0</IGNORED><ERRORS>0</ERRORS></IMPORTRESULT></DATA></BODY></ENVELOPE>"
         response.raise_for_status.return_value = None
         post_mock.side_effect = [requests.ConnectionError("down"), response]
 
