@@ -65,22 +65,82 @@ def _parse_json_strict(payload: str) -> dict[str, Any]:
 
 
 def _compute_confidence(data: dict[str, Any]) -> dict[str, Any]:
-    checks = [
-        data.get("invoice_number"),
-        data.get("invoice_date"),
-        data.get("subtotal"),
-        data.get("taxes"),
-        data.get("total"),
-        data.get("currency"),
-        data.get("seller", {}).get("name") if isinstance(data.get("seller"), dict) else "",
-        data.get("buyer", {}).get("name") if isinstance(data.get("buyer"), dict) else "",
-    ]
-    present = sum(1 for item in checks if isinstance(item, str) and item.strip())
-    total = len(checks)
+    def _is_numeric_string(value: str) -> bool:
+        return bool(re.fullmatch(r"[+-]?(?:\d+\.?\d*|\d*\.\d+)", value.strip()))
+
+    def _is_present(
+        value: Any,
+        *,
+        allow_numeric: bool = False,
+        allow_bool: bool = False,
+        allow_collection: bool = False,
+        allow_numeric_string: bool = False,
+    ) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if not cleaned:
+                return False
+            return allow_numeric_string and _is_numeric_string(cleaned) or not allow_numeric_string
+        if isinstance(value, bool):
+            return allow_bool
+        if isinstance(value, (int, float)):
+            return allow_numeric
+        if allow_collection and isinstance(value, (dict, list, tuple)):
+            return bool(value)
+        return False
+
     line_items = data.get("line_items")
-    if isinstance(line_items, list) and line_items:
-        present += 1
-    total += 1
+    has_line_items = _is_present(line_items, allow_collection=True)
+    has_line_item_totals = isinstance(line_items, list) and any(
+        _is_present(
+            item.get("total_price") if isinstance(item, dict) else None,
+            allow_numeric=True,
+            allow_numeric_string=True,
+        )
+        or _is_present(
+            item.get("taxable_value") if isinstance(item, dict) else None,
+            allow_numeric=True,
+            allow_numeric_string=True,
+        )
+        or _is_present(
+            item.get("tax_amount") if isinstance(item, dict) else None,
+            allow_numeric=True,
+            allow_numeric_string=True,
+        )
+        for item in line_items
+    )
+
+    checks: list[tuple[str, bool]] = [
+        ("invoice_number", _is_present(data.get("invoice_number"))),
+        ("invoice_date", _is_present(data.get("invoice_date"))),
+        (
+            "subtotal",
+            _is_present(data.get("subtotal"), allow_numeric=True, allow_numeric_string=True),
+        ),
+        (
+            "tax",
+            _is_present(data.get("tax"), allow_numeric=True, allow_numeric_string=True)
+            or _is_present(data.get("taxes"), allow_numeric=True, allow_numeric_string=True),
+        ),
+        ("total", _is_present(data.get("total"), allow_numeric=True, allow_numeric_string=True)),
+        ("currency", _is_present(data.get("currency"))),
+        (
+            "seller",
+            _is_present(data.get("seller"), allow_collection=True)
+            or _is_present(data.get("seller"), allow_bool=True),
+        ),
+        (
+            "buyer",
+            _is_present(data.get("buyer"), allow_collection=True)
+            or _is_present(data.get("buyer"), allow_bool=True),
+        ),
+        ("line_items", has_line_items),
+        ("line_item_totals", has_line_item_totals),
+    ]
+    present = sum(1 for _name, is_present in checks if is_present)
+    total = len(checks)
 
     overall = round(present / total, 3) if total else 0.0
     return {
@@ -88,6 +148,7 @@ def _compute_confidence(data: dict[str, Any]) -> dict[str, Any]:
         "method": "heuristic_completeness",
         "fields_present": present,
         "fields_total": total,
+        "inputs": {name: is_present for name, is_present in checks},
     }
 
 
@@ -123,6 +184,7 @@ def extract_structured_invoice(raw_text: str, provider: LLMProvider | None = Non
                 "confidence": confidence,
                 "diagnostics": {
                     **diagnostics,
+                    "confidence_inputs": confidence.get("inputs", {}),
                     "latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
                 },
             }
@@ -148,6 +210,7 @@ def extract_structured_invoice(raw_text: str, provider: LLMProvider | None = Non
                     "confidence": confidence,
                     "diagnostics": {
                         **diagnostics,
+                        "confidence_inputs": confidence.get("inputs", {}),
                         "latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
                     },
                 }
