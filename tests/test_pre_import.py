@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 from tally.master_data import TallyMasterData, TallyMasterDataClient, TallyMasterRecord
 from validation.pre_import import MappingRuleStore, PreImportResolver
@@ -61,7 +62,44 @@ def test_preimport_reject_contains_actionable_details(tmp_path):
     reject_issues = [issue for issue in report.issues if issue.entity_type == "ledger"]
     assert report.blocking is True
     assert reject_issues
-    assert "Fallback policy is 'reject'" in reject_issues[0].message
+    assert reject_issues[0].code == "MASTER_MAPPING_NOT_FOUND"
+    assert "Add a tenant-specific mapping rule" in " ".join(reject_issues[0].remediation)
+
+
+def test_preimport_accepts_code_based_mapping_rule(tmp_path):
+    rules = {
+        "global": {"party": {}, "ledger": {"sales tax": "L200"}, "stock_item": {}},
+        "tenants": {"default": {"party": {}, "ledger": {}, "stock_item": {}}},
+    }
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text(json.dumps(rules), encoding="utf-8")
+
+    resolver = PreImportResolver(_master_data(), MappingRuleStore(json_path=str(rules_path)))
+    report = resolver.resolve_invoice(
+        {"buyer": "ACME CORPORATION", "seller": "Sales Tax", "line_items": []}, tenant_id="default"
+    )
+
+    ledger_resolution = [resolution for resolution in report.resolutions if resolution.entity_type == "ledger"][0]
+    assert ledger_resolution.source == "rule"
+    assert ledger_resolution.resolved_name == "SALES LEDGER"
+
+
+def test_mapping_rule_store_upsert_sqlite(tmp_path):
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text(json.dumps({"global": {}, "tenants": {}}), encoding="utf-8")
+    db_path = tmp_path / "rules.sqlite"
+
+    store = MappingRuleStore(json_path=str(rules_path), sqlite_path=str(db_path))
+    store.upsert("tenant-a", "party", "Acme Limited", "ACME CORPORATION")
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT tally_name FROM mapping_rules WHERE tenant_id = ? AND entity_type = ? AND normalized_value = ?",
+            ("tenant-a", "party", "acme limited"),
+        ).fetchone()
+
+    assert row is not None
+    assert row[0] == "ACME CORPORATION"
 
 
 def test_master_data_client_collection_accessors_read_cache(tmp_path):

@@ -16,12 +16,14 @@ MasterType = Literal["party", "ledger", "stock_item"]
 
 @dataclass(frozen=True)
 class MappingIssue:
+    code: str
     field: str
     entity_type: MasterType
     extracted_value: str
     message: str
     suggestions: tuple[str, ...] = ()
     suggestion_codes: tuple[str, ...] = ()
+    remediation: tuple[str, ...] = ()
     action: Literal["auto_create", "reject", "manual_review"] = "manual_review"
 
 
@@ -66,6 +68,36 @@ class MappingRuleStore:
             if mapped:
                 return str(mapped).strip()
         return None
+
+    def upsert(self, tenant_id: str, entity_type: MasterType, extracted_value: str, tally_name_or_code: str) -> None:
+        """Persist a tenant-specific rule in SQLite when configured."""
+        if not self.sqlite_path:
+            return
+
+        db_file = Path(self.sqlite_path)
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(db_file) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mapping_rules (
+                    tenant_id TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    normalized_value TEXT NOT NULL,
+                    tally_name TEXT NOT NULL,
+                    PRIMARY KEY (tenant_id, entity_type, normalized_value)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO mapping_rules (tenant_id, entity_type, normalized_value, tally_name)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(tenant_id, entity_type, normalized_value)
+                DO UPDATE SET tally_name = excluded.tally_name
+                """,
+                (tenant_id, entity_type, _key(extracted_value), tally_name_or_code.strip()),
+            )
+            conn.commit()
 
     def _load_json(self) -> dict:
         if not self.json_path.exists():
@@ -179,21 +211,26 @@ class PreImportResolver:
     ) -> tuple[EntityResolution, MappingIssue | None]:
         if not extracted_value:
             issue = MappingIssue(
+                code="MISSING_EXTRACTED_VALUE",
                 field=field,
                 entity_type=entity_type,
                 extracted_value=extracted_value,
                 message="No extracted value available for mapping.",
+                remediation=(
+                    "Improve OCR/LLM extraction quality for this field.",
+                    "If this is optional, add a tenant rule to map an empty value to a safe default.",
+                ),
                 action=self.fallback_policy[entity_type],
             )
             return EntityResolution(entity_type, extracted_value, None, None, "unresolved"), issue
 
         rule_match = self.rule_store.lookup(tenant_id, entity_type, extracted_value)
         if rule_match:
-            matched = _find_record(rule_match, master_records)
+            matched = _find_record(rule_match, master_records) or _find_record_by_code(rule_match, master_records)
             if matched:
                 return EntityResolution(entity_type, extracted_value, matched.name, matched.code, "rule"), None
 
-        exact = _find_record(extracted_value, master_records)
+        exact = _find_record(extracted_value, master_records) or _find_record_by_code(extracted_value, master_records)
         if exact:
             return EntityResolution(entity_type, extracted_value, exact.name, exact.code, "exact"), None
 
@@ -204,6 +241,7 @@ class PreImportResolver:
         suggestions = _top_suggestions(extracted_value, master_records)
         policy = self.fallback_policy[entity_type]
         issue = MappingIssue(
+            code="MASTER_MAPPING_NOT_FOUND",
             field=field,
             entity_type=entity_type,
             extracted_value=extracted_value,
@@ -214,6 +252,11 @@ class PreImportResolver:
             ),
             suggestions=tuple(candidate.name for candidate in suggestions),
             suggestion_codes=tuple(candidate.code for candidate in suggestions),
+            remediation=(
+                "Use one of the suggested master names/codes.",
+                "Add a tenant-specific mapping rule in JSON/SQLite.",
+                "Switch fallback policy to 'auto_create' only if governance allows it.",
+            ),
             action=policy,
         )
 
@@ -254,6 +297,11 @@ def _find_alias(name: str, records: tuple[TallyMasterRecord, ...]) -> TallyMaste
         if any(_key(alias) == key for alias in record.aliases):
             return record
     return None
+
+
+def _find_record_by_code(code: str, records: tuple[TallyMasterRecord, ...]) -> TallyMasterRecord | None:
+    key = _key(code)
+    return next((record for record in records if record.code and _key(record.code) == key), None)
 
 
 def _top_suggestions(value: str, records: tuple[TallyMasterRecord, ...], limit: int = 3) -> tuple[TallyMasterRecord, ...]:
