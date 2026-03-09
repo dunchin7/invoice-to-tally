@@ -11,8 +11,10 @@ from uuid import uuid4
 
 from ingestion.router import IngestionError, route_extraction
 from llm.extractor import extract_structured_invoice
+from tally.master_data import TallyMasterDataClient, load_master_data_from_file
 from tally.xml_generator import generate_tally_xml
 from validation.pipeline import run_normalization_pipeline, to_mutable_invoice
+from validation.pre_import import MappingRuleStore, PreImportResolver
 
 
 class InvoiceJobState(str, Enum):
@@ -50,6 +52,12 @@ class InvoiceOrchestrator:
         input_path: str,
         operator: str = "system",
         allow_accounting_override: bool = False,
+        tenant_id: str = "default",
+        master_data_file: str = "",
+        tally_base_url: str = "http://localhost:9000",
+        mapping_rules_file: str = "validation/config/mapping_rules.json",
+        mapping_rules_db: str = "",
+        fallback_policy: dict[str, str] | None = None,
     ) -> Dict[str, Any]:
         job_id = str(uuid4())
         job_path = self.base_path / job_id
@@ -103,9 +111,30 @@ class InvoiceOrchestrator:
                 extraction_result["data"], allow_critical_override=allow_accounting_override
             )
             normalized_payload = to_mutable_invoice(normalization.normalized)
+
+            if master_data_file:
+                master_data = load_master_data_from_file(master_data_file)
+            else:
+                master_client = TallyMasterDataClient(base_url=tally_base_url)
+                master_data = master_client.get_master_data()
+
+            resolver = PreImportResolver(
+                master_data=master_data,
+                rule_store=MappingRuleStore(json_path=mapping_rules_file, sqlite_path=mapping_rules_db or None),
+                fallback_policy=fallback_policy,
+            )
+            preimport_report = resolver.resolve_invoice(normalized_payload, tenant_id=tenant_id)
+            resolved_payload = preimport_report.invoice
+
             normalized_json_path = job_path / "normalized_invoice.json"
-            self._write_json(normalized_json_path, normalized_payload)
+            self._write_json(normalized_json_path, resolved_payload)
             record["artifacts"]["normalized_json"] = str(normalized_json_path)
+
+            reconciliation_payload = {
+                "blocking": preimport_report.blocking,
+                "resolutions": [resolution.__dict__ for resolution in preimport_report.resolutions],
+                "issues": [issue.__dict__ for issue in preimport_report.issues],
+            }
 
             validation_report_path = job_path / "validation_report.json"
             report_payload = {
@@ -113,19 +142,49 @@ class InvoiceOrchestrator:
                 "errors": list(normalization.report.errors),
                 "confidence_flags": dict(normalization.report.confidence_flags),
                 "critical_failure": normalization.report.critical_failure,
+                "master_data_source": master_data.source,
+                "reconciliation": reconciliation_payload,
             }
             self._write_json(validation_report_path, report_payload)
             record["artifacts"]["validation_report"] = str(validation_report_path)
             transition(InvoiceJobState.VALIDATED, "system:invoice_validated", report_payload)
 
+            manual_review_reasons = [issue.__dict__ for issue in preimport_report.issues if issue.action == "manual_review"]
             extraction_confidence = extraction_result.get("confidence", {}).get("overall", 0.0)
-            if extraction_confidence < self.low_confidence_threshold or normalization.report.critical_failure:
+
+            if preimport_report.blocking:
+                actionable = [
+                    {
+                        "field": issue.field,
+                        "entity_type": issue.entity_type,
+                        "extracted_value": issue.extracted_value,
+                        "message": issue.message,
+                        "suggestions": list(issue.suggestions),
+                        "suggestion_codes": list(issue.suggestion_codes),
+                    }
+                    for issue in preimport_report.issues
+                    if issue.action == "reject"
+                ]
+                raise ValueError(f"Pre-import reconciliation failed: {json.dumps(actionable)}")
+
+            if (
+                extraction_confidence < self.low_confidence_threshold
+                or normalization.report.critical_failure
+                or manual_review_reasons
+            ):
                 queue_payload = {
                     "job_id": job_id,
-                    "invoice_number": normalized_payload.get("invoice_number"),
+                    "invoice_number": resolved_payload.get("invoice_number"),
                     "confidence": extraction_confidence,
                     "critical_failure": normalization.report.critical_failure,
-                    "reason": "low_confidence" if extraction_confidence < self.low_confidence_threshold else "validation_failed",
+                    "reason": "manual_review_required"
+                    if manual_review_reasons
+                    else (
+                        "low_confidence"
+                        if extraction_confidence < self.low_confidence_threshold
+                        else "validation_failed"
+                    ),
+                    "reconciliation_issues": manual_review_reasons,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
                 self._append_jsonl(self.review_queue_path, queue_payload)
@@ -133,7 +192,7 @@ class InvoiceOrchestrator:
                 transition(InvoiceJobState.REVIEW_REQUIRED, "system:routed_to_manual_review", queue_payload)
                 return record
 
-            idempotency_key = self._build_idempotency_key(normalized_payload)
+            idempotency_key = self._build_idempotency_key(resolved_payload)
             record["idempotency_key"] = idempotency_key
             idempotency_store = self._read_json(self.idempotency_store_path, default={})
 
@@ -151,12 +210,12 @@ class InvoiceOrchestrator:
                 return record
 
             xml_path = job_path / "tally_invoice.xml"
-            generate_tally_xml(normalized_payload, str(xml_path))
+            generate_tally_xml(resolved_payload, str(xml_path))
             record["artifacts"]["generated_xml"] = str(xml_path)
 
             upload_response = {
                 "status": "success",
-                "voucher_number": normalized_payload.get("invoice_number"),
+                "voucher_number": resolved_payload.get("invoice_number"),
                 "posted_at": datetime.now(timezone.utc).isoformat(),
                 "idempotency_key": idempotency_key,
             }

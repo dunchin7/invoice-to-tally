@@ -21,6 +21,7 @@ class MappingIssue:
     extracted_value: str
     message: str
     suggestions: tuple[str, ...] = ()
+    suggestion_codes: tuple[str, ...] = ()
     action: Literal["auto_create", "reject", "manual_review"] = "manual_review"
 
 
@@ -131,6 +132,20 @@ class PreImportResolver:
         if party_issue:
             issues.append(party_issue)
 
+        seller_name = _extract_name(invoice.get("seller"))
+        ledger_resolution, ledger_issue = self._resolve_entity(
+            tenant_id=tenant_id,
+            entity_type="ledger",
+            field="seller",
+            extracted_value=seller_name,
+            master_records=self.master_data.ledgers,
+        )
+        resolutions.append(ledger_resolution)
+        if ledger_resolution.resolved_name:
+            working["seller"] = _replace_name(invoice.get("seller"), ledger_resolution.resolved_name)
+        if ledger_issue:
+            issues.append(ledger_issue)
+
         resolved_items = []
         for idx, item in enumerate(invoice.get("line_items", []), start=1):
             description = str(item.get("description", "")).strip()
@@ -194,9 +209,11 @@ class PreImportResolver:
             extracted_value=extracted_value,
             message=(
                 f"Could not resolve {entity_type} '{extracted_value}' against Tally master data. "
-                "Add a mapping rule, correct OCR value, or choose a fallback handling strategy."
+                f"Fallback policy is '{policy}'. Add or update mapping rules for tenant '{tenant_id}', "
+                "fix OCR extraction, or route this invoice to manual review."
             ),
-            suggestions=suggestions,
+            suggestions=tuple(candidate.name for candidate in suggestions),
+            suggestion_codes=tuple(candidate.code for candidate in suggestions),
             action=policy,
         )
 
@@ -239,14 +256,14 @@ def _find_alias(name: str, records: tuple[TallyMasterRecord, ...]) -> TallyMaste
     return None
 
 
-def _top_suggestions(value: str, records: tuple[TallyMasterRecord, ...], limit: int = 3) -> tuple[str, ...]:
+def _top_suggestions(value: str, records: tuple[TallyMasterRecord, ...], limit: int = 3) -> tuple[TallyMasterRecord, ...]:
     target = _key(value)
-    scored: list[tuple[int, str]] = []
+    scored: list[tuple[int, TallyMasterRecord]] = []
     for record in records:
         name_key = _key(record.name)
         overlap = len(set(target.split()) & set(name_key.split()))
         if overlap > 0:
-            scored.append((overlap, record.name))
+            scored.append((overlap, record))
 
-    ranked = [name for _, name in sorted(scored, key=lambda row: (-row[0], row[1]))[:limit]]
+    ranked = [record for _, record in sorted(scored, key=lambda row: (-row[0], row[1].name))[:limit]]
     return tuple(ranked)
