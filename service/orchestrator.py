@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from typing import Any, Dict
 from uuid import uuid4
 
-from ingestion.router import IngestionError, route_extraction
+from ingestion.router import IngestionError, route_extraction_with_diagnostics
 from llm.extractor import extract_structured_invoice
 from tally.master_data import TallyMasterDataClient, load_master_data_from_file
 from tally.client import TallyClient, TallyClientConfig, TallyUploadStatus
@@ -105,11 +105,14 @@ class InvoiceOrchestrator:
 
         try:
             transition(InvoiceJobState.INGESTED, "operator:submitted_invoice", {"input_path": str(input_path)})
-            raw_text = route_extraction(input_path)
+            raw_text, ocr_diagnostics = route_extraction_with_diagnostics(input_path, tenant_id=tenant_id)
             raw_text_path = job_path / "raw_ocr_text.txt"
             raw_text_path.write_text(raw_text, encoding="utf-8")
             record["artifacts"]["raw_ocr_text"] = str(raw_text_path)
-            transition(InvoiceJobState.INGESTED, "system:invoice_ingested")
+            ocr_diagnostics_path = job_path / "ocr_diagnostics.json"
+            self._write_json(ocr_diagnostics_path, ocr_diagnostics)
+            record["artifacts"]["ocr_diagnostics"] = str(ocr_diagnostics_path)
+            transition(InvoiceJobState.INGESTED, "system:invoice_ingested", {"ocr_diagnostics": ocr_diagnostics})
 
             extraction_result = extract_structured_invoice(raw_text)
             if extraction_result.get("status") != "success":
@@ -326,7 +329,20 @@ class InvoiceOrchestrator:
             record["error_code"] = exc.code
             record["error_context"] = exc.context
             return record
-        except (IngestionError, RuntimeError, ValueError) as exc:
+        except IngestionError as exc:
+            error_code = getattr(exc, "code", "INGESTION_ERROR")
+            error_context = {"stage": "ingestion_or_ocr", **getattr(exc, "context", {})}
+            details = {
+                "error": str(exc),
+                "error_code": error_code,
+                "error_context": error_context,
+            }
+            transition(InvoiceJobState.FAILED, "system:processing_failed", details)
+            record["error"] = str(exc)
+            record["error_code"] = error_code
+            record["error_context"] = error_context
+            return record
+        except (RuntimeError, ValueError) as exc:
             transition(InvoiceJobState.FAILED, "system:processing_failed", {"error": str(exc)})
             record["error"] = str(exc)
             return record

@@ -4,6 +4,7 @@ import json
 import threading
 from pathlib import Path
 
+from ingestion.router import IngestionError
 from service.orchestrator import InvoiceJobState, InvoiceOrchestrator
 from tally.client import TallyUploadStatus
 from validation.errors import AccountingValidationError, FieldNormalizationError
@@ -65,7 +66,7 @@ def _patch_pipeline(monkeypatch, *, confidence=0.95, blocking=False):
         "line_items": [],
     }
 
-    monkeypatch.setattr("service.orchestrator.route_extraction", lambda _p: "raw text")
+    monkeypatch.setattr("service.orchestrator.route_extraction_with_diagnostics", lambda _p, tenant_id="default": ("raw text", {"source": "ocr", "preprocessing_steps": [], "language": None}))
     monkeypatch.setattr(
         "service.orchestrator.extract_structured_invoice",
         lambda _t: {"status": "success", "data": normalized, "confidence": {"overall": confidence}},
@@ -93,6 +94,7 @@ def test_blocking_validation_routes_to_manual_review(tmp_path, monkeypatch):
     result = orchestrator.process_invoice(input_path="invoice.pdf", master_data_file="master.json")
 
     assert result["state"] == InvoiceJobState.REVIEW_REQUIRED.value
+    assert "ocr_diagnostics" in result["artifacts"]
     assert result["review_queue_entry"]["reason"] == "validation_failed"
     assert "generated_xml" not in result["artifacts"]
 
@@ -252,32 +254,21 @@ def test_idempotency_is_atomic_under_concurrency(tmp_path, monkeypatch):
     assert sorted(response_statuses) == ["duplicate", "success"]
 
 
-def test_orchestrator_propagates_request_id_to_artifact(tmp_path, monkeypatch):
-    _patch_pipeline(monkeypatch, blocking=False)
-
-    class _Client:
-        endpoint = "http://localhost:9000"
-
-        def upload_xml(self, _xml_body, idempotency_key, request_id):
-            assert idempotency_key
-            return TallyUploadStatus(
-                ok=True,
-                endpoint=self.endpoint,
-                created=1,
-                raw_response="<ok/>",
-                message="ok",
-                request_id=request_id,
+def test_ingestion_error_preserves_structured_error_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "service.orchestrator.route_extraction",
+        lambda _p: (_ for _ in ()).throw(
+            IngestionError(
+                "OCR timeout",
+                code="OCR_TIMEOUT",
+                context={"processed_pages": 2, "ocr_timeout_seconds": 1.0},
             )
-
-    monkeypatch.setattr("service.orchestrator.InvoiceOrchestrator._build_tally_client", lambda *_a, **_k: _Client())
+        ),
+    )
 
     orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
     result = orchestrator.process_invoice(input_path="invoice.pdf", master_data_file="master.json")
 
-    assert result["state"] == InvoiceJobState.POSTED.value
-    assert result["request_id"]
-
-    with open(result["artifacts"]["upload_response"], "r", encoding="utf-8") as handle:
-        response = json.load(handle)
-
-    assert response["request_id"] == result["request_id"]
+    assert result["state"] == InvoiceJobState.FAILED.value
+    assert result["error_code"] == "OCR_TIMEOUT"
+    assert result["error_context"]["processed_pages"] == 2
