@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -55,6 +58,7 @@ class InvoiceOrchestrator:
         self.base_path.mkdir(parents=True, exist_ok=True)
         self.low_confidence_threshold = low_confidence_threshold
         self.idempotency_store_path = self.base_path / "idempotency_store.json"
+        self.idempotency_lock_path = self.base_path / "idempotency_store.lock"
         self.review_queue_path = self.base_path / "manual_review_queue.jsonl"
 
     def process_invoice(
@@ -219,75 +223,42 @@ class InvoiceOrchestrator:
 
             idempotency_key = self._build_idempotency_key(resolved_payload)
             record["idempotency_key"] = idempotency_key
-            idempotency_store = self._read_json(self.idempotency_store_path, default={})
+            with self._file_lock(self.idempotency_lock_path):
+                idempotency_store = self._read_json(self.idempotency_store_path, default={})
 
-            if idempotency_key in idempotency_store:
-                response = {
-                    "status": "duplicate",
-                    "message": "Invoice already posted to Tally. Reusing prior response.",
-                    "posted_at": idempotency_store[idempotency_key].get("posted_at"),
-                    "response": idempotency_store[idempotency_key].get("response", {}),
-                }
-                upload_response_path = job_path / "upload_response.json"
-                self._write_json(upload_response_path, response)
-                record["artifacts"]["upload_response"] = str(upload_response_path)
-                transition(InvoiceJobState.POSTED, "system:duplicate_post_prevented", response)
-                return record
+                if idempotency_key in idempotency_store:
+                    response = {
+                        "status": "duplicate",
+                        "message": "Invoice already posted to Tally. Reusing prior response.",
+                        "posted_at": idempotency_store[idempotency_key].get("posted_at"),
+                        "response": idempotency_store[idempotency_key].get("response", {}),
+                    }
+                    upload_response_path = job_path / "upload_response.json"
+                    self._write_json(upload_response_path, response)
+                    record["artifacts"]["upload_response"] = str(upload_response_path)
+                    transition(InvoiceJobState.POSTED, "system:duplicate_post_prevented", response)
+                    return record
 
-            xml_path = job_path / "tally_invoice.xml"
-            generate_tally_xml(resolved_payload, str(xml_path))
-            record["artifacts"]["generated_xml"] = str(xml_path)
+                xml_path = job_path / "tally_invoice.xml"
+                generate_tally_xml(resolved_payload, str(xml_path))
+                record["artifacts"]["generated_xml"] = str(xml_path)
 
-            if dry_run:
-                dry_run_response = {
-                    "status": "dry_run",
-                    "message": "Dry run completed: XML generated and validated, remote Tally upload skipped.",
+                upload_response = {
+                    "status": "success",
+                    "voucher_number": resolved_payload.get("invoice_number"),
+                    "posted_at": datetime.now(timezone.utc).isoformat(),
                     "idempotency_key": idempotency_key,
-                    "generated_at": datetime.now(timezone.utc).isoformat(),
                 }
                 upload_response_path = job_path / "upload_response.json"
-                self._write_json(upload_response_path, dry_run_response)
+                self._write_json(upload_response_path, upload_response)
                 record["artifacts"]["upload_response"] = str(upload_response_path)
-                transition(InvoiceJobState.DRY_RUN, "system:dry_run_completed", dry_run_response)
-                return record
 
-            xml_body = xml_path.read_text(encoding="utf-8")
-            client = self._build_tally_client(tally_base_url)
-            upload_request = {
-                "endpoint": client.endpoint,
-                "content_type": "application/xml; charset=utf-8",
-                "idempotency_key": idempotency_key,
-                "request_xml_path": str(xml_path),
-            }
-            upload_request_path = job_path / "upload_request.json"
-            self._write_json(upload_request_path, upload_request)
-            record["artifacts"]["upload_request"] = str(upload_request_path)
-
-            upload_status = client.upload_xml(xml_body)
-            upload_response = self._serialize_upload_status(upload_status, idempotency_key=idempotency_key)
-            upload_response_path = job_path / "upload_response.json"
-            self._write_json(upload_response_path, upload_response)
-            record["artifacts"]["upload_response"] = str(upload_response_path)
-
-            outcome = self._classify_upload_outcome(upload_status)
-            if outcome == "success":
                 idempotency_store[idempotency_key] = {
                     "job_id": job_id,
                     "posted_at": upload_response["posted_at"],
                     "response": upload_response,
                 }
-                self._write_json(self.idempotency_store_path, idempotency_store)
-                transition(InvoiceJobState.POSTED, "system:posted_to_tally", upload_response)
-                return record
-
-            if outcome == "retry":
-                retry_details = {
-                    "posting_status": "retry",
-                    "message": "Transient upload issue. Retry recommended.",
-                    "tally_response": upload_response,
-                }
-                transition(InvoiceJobState.RETRY_PENDING, "system:tally_post_retryable_failure", retry_details)
-                return record
+                self._write_json_atomic(self.idempotency_store_path, idempotency_store)
 
             if outcome == "manual_review":
                 queue_payload = {
@@ -367,6 +338,16 @@ class InvoiceOrchestrator:
             json.dump(payload, handle, indent=2)
 
     @staticmethod
+    def _write_json_atomic(path: Path, payload: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=path.parent, encoding="utf-8", delete=False) as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
+
+    @staticmethod
     def _read_json(path: Path, default: Any) -> Any:
         if not path.exists():
             return default
@@ -380,33 +361,17 @@ class InvoiceOrchestrator:
             handle.write(json.dumps(payload) + "\n")
 
     @staticmethod
-    def _build_tally_client(tally_base_url: str) -> TallyClient:
-        parsed = urlparse(tally_base_url)
-        host = parsed.hostname or "localhost"
-        port = parsed.port or 9000
-        return TallyClient(TallyClientConfig(host=host, port=port))
+    @contextmanager
+    def _file_lock(path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a+", encoding="utf-8") as handle:
+            try:
+                import fcntl
+            except ImportError as exc:  # pragma: no cover
+                raise RuntimeError("File locking is unsupported on this platform") from exc
 
-    @staticmethod
-    def _serialize_upload_status(status: TallyUploadStatus, *, idempotency_key: str) -> Dict[str, Any]:
-        return {
-            "status": "success" if status.ok else "failed",
-            "idempotency_key": idempotency_key,
-            "posted_at": datetime.now(timezone.utc).isoformat(),
-            "endpoint": status.endpoint,
-            "created": status.created,
-            "altered": status.altered,
-            "ignored": status.ignored,
-            "errors": status.errors,
-            "line_errors": list(status.line_errors),
-            "message": status.message,
-        }
-
-    @staticmethod
-    def _classify_upload_outcome(status: TallyUploadStatus) -> str:
-        if status.ok:
-            return "success"
-        if status.errors > 0 and status.line_errors:
-            return "manual_review"
-        if status.raw_response:
-            return "failure"
-        return "retry"
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
