@@ -313,7 +313,20 @@ class InvoiceOrchestrator:
             record["error_code"] = exc.code
             record["error_context"] = exc.context
             return record
-        except (IngestionError, RuntimeError, ValueError) as exc:
+        except IngestionError as exc:
+            error_code = getattr(exc, "code", "INGESTION_ERROR")
+            error_context = {"stage": "ingestion_or_ocr", **getattr(exc, "context", {})}
+            details = {
+                "error": str(exc),
+                "error_code": error_code,
+                "error_context": error_context,
+            }
+            transition(InvoiceJobState.FAILED, "system:processing_failed", details)
+            record["error"] = str(exc)
+            record["error_code"] = error_code
+            record["error_context"] = error_context
+            return record
+        except (RuntimeError, ValueError) as exc:
             transition(InvoiceJobState.FAILED, "system:processing_failed", {"error": str(exc)})
             record["error"] = str(exc)
             return record

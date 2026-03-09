@@ -17,6 +17,8 @@ class Settings:
     tally_timeout_seconds: float = 15.0
     tally_max_retries: int = 3
     tally_retry_backoff_seconds: float = 1.0
+    ocr_timeout_seconds: float = 30.0
+    ocr_max_pages: int = 20
 
 
 def _parse_int(name: str, default: int) -> int:
@@ -52,6 +54,8 @@ def load_settings() -> Settings:
         tally_timeout_seconds=_parse_float("TALLY_TIMEOUT_SECONDS", 15.0),
         tally_max_retries=_parse_int("TALLY_MAX_RETRIES", 3),
         tally_retry_backoff_seconds=_parse_float("TALLY_RETRY_BACKOFF_SECONDS", 1.0),
+        ocr_timeout_seconds=_parse_float("OCR_TIMEOUT_SECONDS", 30.0),
+        ocr_max_pages=_parse_int("OCR_MAX_PAGES", 20),
     )
 
 

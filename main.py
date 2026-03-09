@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 from service.orchestrator import InvoiceOrchestrator
 
@@ -24,11 +25,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stock-fallback", choices=["auto_create", "reject", "manual_review"], default="manual_review")
     parser.add_argument("--reconciliation-approved", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--ocr-timeout-seconds", type=float, default=None)
+    parser.add_argument("--ocr-max-pages", type=int, default=None)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.ocr_timeout_seconds is not None:
+        os.environ["OCR_TIMEOUT_SECONDS"] = str(args.ocr_timeout_seconds)
+    if args.ocr_max_pages is not None:
+        os.environ["OCR_MAX_PAGES"] = str(args.ocr_max_pages)
+
     orchestrator = InvoiceOrchestrator(
         output_dir=args.orchestration_output,
         low_confidence_threshold=args.low_confidence_threshold,
