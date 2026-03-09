@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 
+from ingestion.router import IngestionError
 from service.orchestrator import InvoiceJobState, InvoiceOrchestrator
 from tally.client import TallyUploadStatus
 from validation.errors import AccountingValidationError, FieldNormalizationError
@@ -245,3 +246,23 @@ def test_idempotency_is_atomic_under_concurrency(tmp_path, monkeypatch):
             response_statuses.append(json.load(handle)["status"])
 
     assert sorted(response_statuses) == ["duplicate", "success"]
+
+
+def test_ingestion_error_preserves_structured_error_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "service.orchestrator.route_extraction",
+        lambda _p: (_ for _ in ()).throw(
+            IngestionError(
+                "OCR timeout",
+                code="OCR_TIMEOUT",
+                context={"processed_pages": 2, "ocr_timeout_seconds": 1.0},
+            )
+        ),
+    )
+
+    orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
+    result = orchestrator.process_invoice(input_path="invoice.pdf", master_data_file="master.json")
+
+    assert result["state"] == InvoiceJobState.FAILED.value
+    assert result["error_code"] == "OCR_TIMEOUT"
+    assert result["error_context"]["processed_pages"] == 2
