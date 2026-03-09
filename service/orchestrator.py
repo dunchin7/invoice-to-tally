@@ -9,12 +9,14 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any, Dict
 from uuid import uuid4
 
 from ingestion.router import IngestionError, route_extraction
 from llm.extractor import extract_structured_invoice
 from tally.master_data import TallyMasterDataClient, load_master_data_from_file
+from tally.client import TallyClient, TallyClientConfig, TallyUploadStatus
 from tally.xml_generator import generate_tally_xml
 from validation.errors import (
     AccountingValidationError,
@@ -31,6 +33,8 @@ class InvoiceJobState(str, Enum):
     EXTRACTED = "extracted"
     VALIDATED = "validated"
     REVIEW_REQUIRED = "review_required"
+    RETRY_PENDING = "retry_pending"
+    DRY_RUN = "dry_run"
     POSTED = "posted"
     FAILED = "failed"
 
@@ -69,6 +73,7 @@ class InvoiceOrchestrator:
         mapping_rules_db: str = "",
         fallback_policy: dict[str, str] | None = None,
         reconciliation_approved: bool = False,
+        dry_run: bool = False,
     ) -> Dict[str, Any]:
         job_id = str(uuid4())
         job_path = self.base_path / job_id
@@ -255,7 +260,25 @@ class InvoiceOrchestrator:
                 }
                 self._write_json_atomic(self.idempotency_store_path, idempotency_store)
 
-            transition(InvoiceJobState.POSTED, "system:posted_to_tally", upload_response)
+            if outcome == "manual_review":
+                queue_payload = {
+                    "job_id": job_id,
+                    "invoice_number": resolved_payload.get("invoice_number"),
+                    "confidence": extraction_confidence,
+                    "critical_failure": normalization.report.critical_failure,
+                    "reason": "tally_rejected",
+                    "tally_response": upload_response,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                self._append_jsonl(self.review_queue_path, queue_payload)
+                record["review_queue_entry"] = queue_payload
+                transition(InvoiceJobState.REVIEW_REQUIRED, "system:tally_post_manual_review", queue_payload)
+                return record
+            transition(
+                InvoiceJobState.FAILED,
+                "system:tally_post_failed",
+                {"posting_status": "failure", "tally_response": upload_response},
+            )
             return record
 
         except (SchemaValidationError, FieldNormalizationError) as exc:

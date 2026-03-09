@@ -4,6 +4,7 @@ import json
 import threading
 
 from service.orchestrator import InvoiceJobState, InvoiceOrchestrator
+from tally.client import TallyUploadStatus
 from validation.errors import AccountingValidationError, FieldNormalizationError
 
 
@@ -78,6 +79,10 @@ def _patch_pipeline(monkeypatch, *, confidence=0.95, blocking=False):
         "service.orchestrator.PreImportResolver",
         lambda **_kwargs: _Resolver(_PreImportReport(normalized, blocking=blocking, issues=[_Issue()] if blocking else [])),
     )
+    monkeypatch.setattr(
+        "service.orchestrator.generate_tally_xml",
+        lambda _invoice, path: Path(path).write_text("<ENVELOPE/>", encoding="utf-8"),
+    )
 
 
 def test_blocking_validation_routes_to_manual_review(tmp_path, monkeypatch):
@@ -98,8 +103,16 @@ def test_idempotency_prevents_duplicate_posting(tmp_path, monkeypatch):
 
     def _generate_xml(_invoice, path):
         generated.append(path)
+        Path(path).write_text("<ENVELOPE/>", encoding="utf-8")
+
+    class _Client:
+        endpoint = "http://localhost:9000"
+
+        def upload_xml(self, _xml_body):
+            return TallyUploadStatus(ok=True, endpoint=self.endpoint, created=1, raw_response="<ok/>", message="ok")
 
     monkeypatch.setattr("service.orchestrator.generate_tally_xml", _generate_xml)
+    monkeypatch.setattr("service.orchestrator.InvoiceOrchestrator._build_tally_client", lambda *_a, **_k: _Client())
 
     orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
     first = orchestrator.process_invoice(input_path="invoice.pdf", master_data_file="master.json")
@@ -132,6 +145,10 @@ def test_reconciliation_payload_includes_rule_learning_summary(tmp_path, monkeyp
     monkeypatch.setattr(
         "service.orchestrator.PreImportResolver",
         lambda **_kwargs: _Resolver(_PreImportReport(normalized, blocking=False, issues=[], learned_rules=learned)),
+    )
+    monkeypatch.setattr(
+        "service.orchestrator.InvoiceOrchestrator._build_tally_client",
+        lambda *_a, **_k: type("Client", (), {"endpoint": "http://localhost:9000", "upload_xml": lambda self, _xml: TallyUploadStatus(ok=True, endpoint=self.endpoint, created=1, raw_response="<ok/>", message="ok")})(),
     )
 
     orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
