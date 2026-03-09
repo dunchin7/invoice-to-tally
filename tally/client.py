@@ -45,14 +45,14 @@ def _is_transient(exc: Exception) -> bool:
     return False
 
 
-def _extract_int(root: ElementTree.Element, tag: str) -> int:
-    node = root.find(f".//{tag}")
+def _extract_int(root: ElementTree.Element, tag: str) -> int | None:
+    node = root.find(tag)
     if node is None or node.text is None:
-        return 0
+        return None
     try:
         return int(node.text.strip())
     except ValueError:
-        return 0
+        return None
 
 
 def parse_tally_response(xml_body: str, endpoint: str) -> TallyUploadStatus:
@@ -66,13 +66,30 @@ def parse_tally_response(xml_body: str, endpoint: str) -> TallyUploadStatus:
             message=f"Unable to parse Tally response XML: {exc}",
         )
 
-    created = _extract_int(root, "CREATED")
-    altered = _extract_int(root, "ALTERED")
-    ignored = _extract_int(root, "IGNORED")
-    errors = _extract_int(root, "ERRORS")
+    import_result = root.find(".//IMPORTRESULT")
+    if import_result is None:
+        return TallyUploadStatus(
+            ok=False,
+            endpoint=endpoint,
+            raw_response=xml_body,
+            message="Malformed Tally response: missing IMPORTRESULT section.",
+        )
+
+    created = _extract_int(import_result, "CREATED")
+    altered = _extract_int(import_result, "ALTERED")
+    ignored = _extract_int(import_result, "IGNORED")
+    errors = _extract_int(import_result, "ERRORS")
+    if None in (created, altered, ignored, errors):
+        return TallyUploadStatus(
+            ok=False,
+            endpoint=endpoint,
+            raw_response=xml_body,
+            message="Malformed Tally response: missing or invalid IMPORTRESULT counters.",
+        )
+
     line_errors: List[str] = []
 
-    for line_error in root.findall(".//LINEERROR"):
+    for line_error in import_result.findall(".//LINEERROR"):
         if line_error.text and line_error.text.strip():
             line_errors.append(line_error.text.strip())
 
