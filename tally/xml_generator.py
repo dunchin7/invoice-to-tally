@@ -68,8 +68,18 @@ def _party_ledger_name(party: Any) -> str:
 
 
 def _normalize_tally_date(invoice_date: str) -> str:
-    parsed = datetime.strptime(invoice_date, "%Y-%m-%d")
-    return parsed.strftime("%Y%m%d")
+    if isinstance(invoice_date, datetime):
+        return invoice_date.strftime("%Y%m%d")
+
+    date_text = str(invoice_date).strip()
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            parsed = datetime.strptime(date_text, fmt)
+            return parsed.strftime("%Y%m%d")
+        except ValueError:
+            continue
+
+    raise ValueError(f"Unsupported invoice_date format: {invoice_date}")
 
 
 def _resolve_voucher_type(invoice: dict[str, Any], config: dict[str, Any]) -> str:
@@ -104,7 +114,7 @@ def _collect_amounts(invoice: dict[str, Any]) -> dict[str, Decimal]:
     sgst = Decimal("0")
     igst = Decimal("0")
 
-    for item in line_items:
+    for item in invoice.get("line_items", []):
         item_total = _to_decimal(item.get("total_price"))
         item_tax = _to_decimal(item.get("tax_amount"))
         item_taxable = _to_decimal(item.get("taxable_value"), default="-1")
@@ -118,6 +128,7 @@ def _collect_amounts(invoice: dict[str, Any]) -> dict[str, Decimal]:
         igst += _to_decimal(item.get("igst_amount"))
 
     if not any([cgst, sgst, igst]):
+        # Fallback: when item-level split tax is not present.
         igst = _to_decimal(invoice.get("tax"))
 
     total = _to_decimal(invoice.get("total"))
@@ -151,7 +162,11 @@ def map_invoice_to_voucher(invoice: dict[str, Any], config: dict[str, Any] | Non
 
     entries: list[VoucherLedgerEntry] = [
         VoucherLedgerEntry(ledger_name=receivables_ledger, amount=amounts["total"], entry_type="debit"),
-        VoucherLedgerEntry(ledger_name=ledger_resolver("sales", invoice), amount=amounts["taxable"], entry_type="credit"),
+        VoucherLedgerEntry(
+            ledger_name=ledger_resolver("sales", invoice),
+            amount=amounts["taxable"],
+            entry_type="credit",
+        ),
     ]
 
     for tax_role in ("cgst", "sgst", "igst"):
