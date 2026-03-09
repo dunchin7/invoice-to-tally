@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Mapping, Tuple
 from jsonschema import ValidationError, validate
 
 from schema.invoice_schema import invoice_schema
+from validation.errors import AccountingValidationError, FieldNormalizationError, SchemaValidationError
 
 DATE_FORMATS = (
     "%Y-%m-%d",
@@ -245,6 +246,12 @@ def _freeze_normalized(data: Dict[str, Any]) -> Mapping[str, Any]:
 
 
 def run_normalization_pipeline(raw_data: Dict[str, Any], allow_critical_override: bool = False) -> NormalizationResult:
+    if raw_data is not None and not isinstance(raw_data, Mapping):
+        raise FieldNormalizationError(
+            "Invoice payload must be a JSON object for normalization.",
+            context={"field": "invoice", "expected": "object", "actual": type(raw_data).__name__},
+        )
+
     data = copy.deepcopy(raw_data) if raw_data is not None else {}
 
     warnings: List[str] = []
@@ -291,8 +298,16 @@ def run_normalization_pipeline(raw_data: Dict[str, Any], allow_critical_override
         validate(instance=normalized, schema=invoice_schema)
         confidence_flags["schema_valid"] = True
     except ValidationError as exc:
-        errors.append(f"Schema validation failed: {exc.message}")
         confidence_flags["schema_valid"] = False
+        field = ".".join(str(part) for part in exc.absolute_path) or "invoice"
+        raise SchemaValidationError(
+            f"Schema validation failed: {exc.message}",
+            context={
+                "field": field,
+                "expected": exc.validator_value,
+                "actual": exc.instance,
+            },
+        ) from exc
 
     _cross_field_checks(normalized, errors, confidence_flags)
 
@@ -305,10 +320,13 @@ def run_normalization_pipeline(raw_data: Dict[str, Any], allow_critical_override
     )
 
     if critical_failure and not allow_critical_override:
-        raise ValueError(
-            "Validation failed with critical accounting mismatches. "
-            "Re-run with allow_critical_override=True (or --allow-accounting-override) to continue. "
-            f"Errors: {' | '.join(errors)}"
+        raise AccountingValidationError(
+            "Validation failed with critical accounting mismatches.",
+            context={
+                "field": "totals",
+                "expected": "subtotal + tax == total and line totals == subtotal",
+                "actual": list(errors),
+            },
         )
 
     return NormalizationResult(normalized=_freeze_normalized(normalized), report=report)
