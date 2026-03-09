@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 
 from service.orchestrator import InvoiceJobState, InvoiceOrchestrator
 from tally.client import TallyUploadStatus
@@ -108,8 +109,8 @@ def test_idempotency_prevents_duplicate_posting(tmp_path, monkeypatch):
     class _Client:
         endpoint = "http://localhost:9000"
 
-        def upload_xml(self, _xml_body):
-            return TallyUploadStatus(ok=True, endpoint=self.endpoint, created=1, raw_response="<ok/>", message="ok")
+        def upload_xml(self, _xml_body, idempotency_key, request_id):
+            return TallyUploadStatus(ok=True, endpoint=self.endpoint, created=1, raw_response="<ok/>", message="ok", request_id=request_id)
 
     monkeypatch.setattr("service.orchestrator.generate_tally_xml", _generate_xml)
     monkeypatch.setattr("service.orchestrator.InvoiceOrchestrator._build_tally_client", lambda *_a, **_k: _Client())
@@ -148,7 +149,7 @@ def test_reconciliation_payload_includes_rule_learning_summary(tmp_path, monkeyp
     )
     monkeypatch.setattr(
         "service.orchestrator.InvoiceOrchestrator._build_tally_client",
-        lambda *_a, **_k: type("Client", (), {"endpoint": "http://localhost:9000", "upload_xml": lambda self, _xml: TallyUploadStatus(ok=True, endpoint=self.endpoint, created=1, raw_response="<ok/>", message="ok")})(),
+        lambda *_a, **_k: type("Client", (), {"endpoint": "http://localhost:9000", "upload_xml": lambda self, _xml, idempotency_key, request_id: TallyUploadStatus(ok=True, endpoint=self.endpoint, created=1, raw_response="<ok/>", message="ok", request_id=request_id)})(),
     )
 
     orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
@@ -222,7 +223,11 @@ def test_idempotency_is_atomic_under_concurrency(tmp_path, monkeypatch):
         return original_builder(invoice)
 
     monkeypatch.setattr(orchestrator, "_build_idempotency_key", _waited_builder)
-    monkeypatch.setattr("service.orchestrator.generate_tally_xml", lambda _invoice, path: generated.append(path))
+    monkeypatch.setattr("service.orchestrator.generate_tally_xml", lambda _invoice, path: (generated.append(path), Path(path).write_text("<ENVELOPE/>", encoding="utf-8")))
+    monkeypatch.setattr(
+        "service.orchestrator.InvoiceOrchestrator._build_tally_client",
+        lambda *_a, **_k: type("Client", (), {"endpoint": "http://localhost:9000", "upload_xml": lambda self, _xml, idempotency_key, request_id: TallyUploadStatus(ok=True, endpoint=self.endpoint, created=1, raw_response="<ok/>", message="ok", request_id=request_id)})(),
+    )
 
     results = []
 
@@ -245,3 +250,34 @@ def test_idempotency_is_atomic_under_concurrency(tmp_path, monkeypatch):
             response_statuses.append(json.load(handle)["status"])
 
     assert sorted(response_statuses) == ["duplicate", "success"]
+
+
+def test_orchestrator_propagates_request_id_to_artifact(tmp_path, monkeypatch):
+    _patch_pipeline(monkeypatch, blocking=False)
+
+    class _Client:
+        endpoint = "http://localhost:9000"
+
+        def upload_xml(self, _xml_body, idempotency_key, request_id):
+            assert idempotency_key
+            return TallyUploadStatus(
+                ok=True,
+                endpoint=self.endpoint,
+                created=1,
+                raw_response="<ok/>",
+                message="ok",
+                request_id=request_id,
+            )
+
+    monkeypatch.setattr("service.orchestrator.InvoiceOrchestrator._build_tally_client", lambda *_a, **_k: _Client())
+
+    orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
+    result = orchestrator.process_invoice(input_path="invoice.pdf", master_data_file="master.json")
+
+    assert result["state"] == InvoiceJobState.POSTED.value
+    assert result["request_id"]
+
+    with open(result["artifacts"]["upload_response"], "r", encoding="utf-8") as handle:
+        response = json.load(handle)
+
+    assert response["request_id"] == result["request_id"]

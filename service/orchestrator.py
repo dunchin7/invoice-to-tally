@@ -222,7 +222,9 @@ class InvoiceOrchestrator:
                 return record
 
             idempotency_key = self._build_idempotency_key(resolved_payload)
+            request_id = str(uuid4())
             record["idempotency_key"] = idempotency_key
+            record["request_id"] = request_id
             with self._file_lock(self.idempotency_lock_path):
                 idempotency_store = self._read_json(self.idempotency_store_path, default={})
 
@@ -231,6 +233,7 @@ class InvoiceOrchestrator:
                         "status": "duplicate",
                         "message": "Invoice already posted to Tally. Reusing prior response.",
                         "posted_at": idempotency_store[idempotency_key].get("posted_at"),
+                        "request_id": idempotency_store[idempotency_key].get("request_id", request_id),
                         "response": idempotency_store[idempotency_key].get("response", {}),
                     }
                     upload_response_path = job_path / "upload_response.json"
@@ -243,42 +246,52 @@ class InvoiceOrchestrator:
                 generate_tally_xml(resolved_payload, str(xml_path))
                 record["artifacts"]["generated_xml"] = str(xml_path)
 
-                upload_response = {
-                    "status": "success",
-                    "voucher_number": resolved_payload.get("invoice_number"),
-                    "posted_at": datetime.now(timezone.utc).isoformat(),
-                    "idempotency_key": idempotency_key,
-                }
+                if dry_run:
+                    upload_response = {
+                        "status": "dry_run",
+                        "voucher_number": resolved_payload.get("invoice_number"),
+                        "posted_at": datetime.now(timezone.utc).isoformat(),
+                        "idempotency_key": idempotency_key,
+                        "request_id": request_id,
+                        "message": "Dry run enabled; upload skipped.",
+                    }
+                    state = InvoiceJobState.DRY_RUN
+                    action = "system:dry_run_completed"
+                else:
+                    client = self._build_tally_client(tally_base_url)
+                    xml_body = xml_path.read_text(encoding="utf-8")
+                    status = client.upload_xml(xml_body, idempotency_key=idempotency_key, request_id=request_id)
+                    upload_response = {
+                        "status": "success" if status.ok else "failure",
+                        "voucher_number": resolved_payload.get("invoice_number"),
+                        "posted_at": datetime.now(timezone.utc).isoformat(),
+                        "idempotency_key": idempotency_key,
+                        "request_id": status.request_id,
+                        "tally_endpoint": status.endpoint,
+                        "tally_message": status.message,
+                        "created": status.created,
+                        "altered": status.altered,
+                        "ignored": status.ignored,
+                        "errors": status.errors,
+                        "line_errors": list(status.line_errors),
+                    }
+                    state = InvoiceJobState.POSTED if status.ok else InvoiceJobState.FAILED
+                    action = "system:tally_posted" if status.ok else "system:tally_post_failed"
+
                 upload_response_path = job_path / "upload_response.json"
                 self._write_json(upload_response_path, upload_response)
                 record["artifacts"]["upload_response"] = str(upload_response_path)
 
-                idempotency_store[idempotency_key] = {
-                    "job_id": job_id,
-                    "posted_at": upload_response["posted_at"],
-                    "response": upload_response,
-                }
-                self._write_json_atomic(self.idempotency_store_path, idempotency_store)
+                if upload_response["status"] == "success":
+                    idempotency_store[idempotency_key] = {
+                        "job_id": job_id,
+                        "posted_at": upload_response["posted_at"],
+                        "request_id": upload_response["request_id"],
+                        "response": upload_response,
+                    }
+                    self._write_json_atomic(self.idempotency_store_path, idempotency_store)
 
-            if outcome == "manual_review":
-                queue_payload = {
-                    "job_id": job_id,
-                    "invoice_number": resolved_payload.get("invoice_number"),
-                    "confidence": extraction_confidence,
-                    "critical_failure": normalization.report.critical_failure,
-                    "reason": "tally_rejected",
-                    "tally_response": upload_response,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-                self._append_jsonl(self.review_queue_path, queue_payload)
-                record["review_queue_entry"] = queue_payload
-                transition(InvoiceJobState.REVIEW_REQUIRED, "system:tally_post_manual_review", queue_payload)
-                return record
-            transition(
-                InvoiceJobState.FAILED,
-                "system:tally_post_failed",
-                {"posting_status": "failure", "tally_response": upload_response},
-            )
+            transition(state, action, upload_response)
             return record
 
         except (SchemaValidationError, FieldNormalizationError) as exc:
@@ -317,6 +330,13 @@ class InvoiceOrchestrator:
             transition(InvoiceJobState.FAILED, "system:processing_failed", {"error": str(exc)})
             record["error"] = str(exc)
             return record
+
+    @staticmethod
+    def _build_tally_client(tally_base_url: str) -> TallyClient:
+        parsed = urlparse(tally_base_url)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or (443 if parsed.scheme == "https" else 9000)
+        return TallyClient(TallyClientConfig(host=host, port=port))
 
     @staticmethod
     def _build_idempotency_key(invoice: Dict[str, Any]) -> str:
