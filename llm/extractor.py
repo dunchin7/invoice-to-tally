@@ -7,8 +7,10 @@ import time
 from typing import Any, Callable
 
 from dotenv import load_dotenv
+from jsonschema import ValidationError, validate
 
 from llm.providers import GeminiProvider, LLMProvider
+from schema.invoice_schema import invoice_schema
 
 load_dotenv()
 
@@ -64,18 +66,22 @@ def _parse_json_strict(payload: str) -> dict[str, Any]:
     return parsed
 
 
-def _compute_confidence(data: dict[str, Any]) -> dict[str, Any]:
+def _compute_completeness_score(data: dict[str, Any]) -> tuple[float, int, int]:
     checks = [
         data.get("invoice_number"),
         data.get("invoice_date"),
         data.get("subtotal"),
-        data.get("taxes"),
+        data.get("tax"),
         data.get("total"),
         data.get("currency"),
         data.get("seller", {}).get("name") if isinstance(data.get("seller"), dict) else "",
         data.get("buyer", {}).get("name") if isinstance(data.get("buyer"), dict) else "",
     ]
-    present = sum(1 for item in checks if isinstance(item, str) and item.strip())
+    present = sum(
+        1
+        for item in checks
+        if (isinstance(item, str) and item.strip()) or isinstance(item, (int, float))
+    )
     total = len(checks)
     line_items = data.get("line_items")
     if isinstance(line_items, list) and line_items:
@@ -83,11 +89,56 @@ def _compute_confidence(data: dict[str, Any]) -> dict[str, Any]:
     total += 1
 
     overall = round(present / total, 3) if total else 0.0
+    return overall, present, total
+
+
+def _compute_schema_valid_score(data: dict[str, Any]) -> tuple[float, bool]:
+    try:
+        validate(instance=data, schema=invoice_schema)
+        return 1.0, True
+    except ValidationError:
+        return 0.0, False
+
+
+def _compute_accounting_consistency_score(data: dict[str, Any], tolerance: float = 0.05) -> float:
+    subtotal = data.get("subtotal")
+    tax = data.get("tax")
+    total = data.get("total")
+
+    if not all(isinstance(value, (int, float)) for value in (subtotal, tax, total)):
+        return 0.0
+
+    expected_total = float(subtotal) + float(tax)
+    delta = abs(expected_total - float(total))
+    return 1.0 if delta <= tolerance else 0.0
+
+
+def _compute_confidence(
+    data: dict[str, Any],
+    *,
+    repair_attempted: bool,
+    repair_succeeded: bool,
+) -> dict[str, Any]:
+    completeness_score, fields_present, fields_total = _compute_completeness_score(data)
+    schema_valid_score, schema_valid = _compute_schema_valid_score(data)
+    accounting_consistency_score = _compute_accounting_consistency_score(data)
+
+    overall = round(
+        (0.5 * completeness_score) + (0.25 * schema_valid_score) + (0.25 * accounting_consistency_score),
+        3,
+    )
+
     return {
         "overall": overall,
-        "method": "heuristic_completeness",
-        "fields_present": present,
-        "fields_total": total,
+        "method": "weighted_components_v2",
+        "fields_present": fields_present,
+        "fields_total": fields_total,
+        "completeness_score": completeness_score,
+        "schema_valid_score": schema_valid_score,
+        "schema_valid": schema_valid,
+        "accounting_consistency_score": accounting_consistency_score,
+        "repair_attempted": repair_attempted,
+        "repair_succeeded": repair_succeeded,
     }
 
 
@@ -115,7 +166,7 @@ def extract_structured_invoice(raw_text: str, provider: LLMProvider | None = Non
 
         try:
             data = _parse_json_strict(cleaned)
-            confidence = _compute_confidence(data)
+            confidence = _compute_confidence(data, repair_attempted=False, repair_succeeded=False)
             diagnostics["parse_strategy"] = "strict_json"
             return {
                 "status": "success",
@@ -140,7 +191,7 @@ def extract_structured_invoice(raw_text: str, provider: LLMProvider | None = Non
             repaired_cleaned = _clean_model_output(repaired_response)
             try:
                 repaired_data = _parse_json_strict(repaired_cleaned)
-                confidence = _compute_confidence(repaired_data)
+                confidence = _compute_confidence(repaired_data, repair_attempted=True, repair_succeeded=True)
                 diagnostics["parse_strategy"] = "repaired_json"
                 return {
                     "status": "success",
@@ -164,9 +215,15 @@ def extract_structured_invoice(raw_text: str, provider: LLMProvider | None = Non
                     "data": None,
                     "confidence": {
                         "overall": 0.0,
-                        "method": "heuristic_completeness",
+                        "method": "weighted_components_v2",
                         "fields_present": 0,
                         "fields_total": 0,
+                        "completeness_score": 0.0,
+                        "schema_valid_score": 0.0,
+                        "schema_valid": False,
+                        "accounting_consistency_score": 0.0,
+                        "repair_attempted": True,
+                        "repair_succeeded": False,
                     },
                     "diagnostics": {
                         **diagnostics,
@@ -186,9 +243,15 @@ def extract_structured_invoice(raw_text: str, provider: LLMProvider | None = Non
             "data": None,
             "confidence": {
                 "overall": 0.0,
-                "method": "heuristic_completeness",
+                "method": "weighted_components_v2",
                 "fields_present": 0,
                 "fields_total": 0,
+                "completeness_score": 0.0,
+                "schema_valid_score": 0.0,
+                "schema_valid": False,
+                "accounting_consistency_score": 0.0,
+                "repair_attempted": False,
+                "repair_succeeded": False,
             },
             "diagnostics": {
                 **diagnostics,
