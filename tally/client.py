@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import time
+import logging
+import re
 from dataclasses import dataclass
 from typing import List
+from uuid import uuid4
 from xml.etree import ElementTree
 
 import requests
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -35,6 +41,7 @@ class TallyUploadStatus:
     line_errors: tuple[str, ...] = ()
     raw_response: str = ""
     message: str = ""
+    request_id: str = ""
 
 
 def _is_transient(exc: Exception) -> bool:
@@ -104,11 +111,19 @@ class TallyClient:
     def endpoint(self) -> str:
         return self._config.endpoint
 
-    def upload_xml(self, xml_body: str) -> TallyUploadStatus:
+    @staticmethod
+    def _redact_xml_payload(xml_body: str) -> str:
+        redacted = re.sub(r">([^<]+)<", r">***<", xml_body)
+        return redacted[:300]
+
+    def upload_xml(self, xml_body: str, idempotency_key: str, request_id: str | None = None) -> TallyUploadStatus:
         endpoint = self._config.endpoint
         last_error: Exception | None = None
+        request_id = request_id or str(uuid4())
+        redacted_payload_preview = self._redact_xml_payload(xml_body)
 
         for attempt in range(self._config.max_retries + 1):
+            started_at = time.monotonic()
             try:
                 response = requests.post(
                     endpoint,
@@ -117,9 +132,38 @@ class TallyClient:
                     timeout=self._config.timeout_seconds,
                 )
                 response.raise_for_status()
-                return parse_tally_response(response.text, endpoint=endpoint)
+                parsed = parse_tally_response(response.text, endpoint=endpoint)
+                parsed_status = "ok" if parsed.ok else "tally_error"
+                LOGGER.info(
+                    "tally_upload_attempt",
+                    extra={
+                        "request_id": request_id,
+                        "idempotency_key": idempotency_key,
+                        "attempt_number": attempt + 1,
+                        "endpoint": endpoint,
+                        "latency_ms": round((time.monotonic() - started_at) * 1000, 3),
+                        "parsed_status": parsed_status,
+                        "error_class": None if parsed.ok else "tally_response_error",
+                        "payload_preview": redacted_payload_preview,
+                    },
+                )
+                return TallyUploadStatus(**{**parsed.__dict__, "request_id": request_id})
             except Exception as exc:
                 last_error = exc
+                error_class = exc.__class__.__name__
+                LOGGER.info(
+                    "tally_upload_attempt",
+                    extra={
+                        "request_id": request_id,
+                        "idempotency_key": idempotency_key,
+                        "attempt_number": attempt + 1,
+                        "endpoint": endpoint,
+                        "latency_ms": round((time.monotonic() - started_at) * 1000, 3),
+                        "parsed_status": "transport_error",
+                        "error_class": error_class,
+                        "payload_preview": redacted_payload_preview,
+                    },
+                )
                 if attempt >= self._config.max_retries or not _is_transient(exc):
                     break
                 time.sleep(self._config.retry_backoff_seconds * (2**attempt))
@@ -129,4 +173,5 @@ class TallyClient:
             endpoint=endpoint,
             raw_response="",
             message=f"Failed to upload to Tally endpoint after retries: {last_error}",
+            request_id=request_id,
         )
