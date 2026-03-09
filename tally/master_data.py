@@ -45,6 +45,18 @@ class TallyMasterDataClient:
         self._write_cache(live)
         return live
 
+    def get_party_masters(self, force_refresh: bool = False) -> tuple[TallyMasterRecord, ...]:
+        """Convenience API for callers that only need party masters."""
+        return self.get_master_data(force_refresh=force_refresh).parties
+
+    def get_ledger_masters(self, force_refresh: bool = False) -> tuple[TallyMasterRecord, ...]:
+        """Convenience API for callers that only need ledger masters."""
+        return self.get_master_data(force_refresh=force_refresh).ledgers
+
+    def get_stock_item_masters(self, force_refresh: bool = False) -> tuple[TallyMasterRecord, ...]:
+        """Convenience API for callers that only need stock-item masters."""
+        return self.get_master_data(force_refresh=force_refresh).stock_items
+
     def _fetch_from_tally(self) -> TallyMasterData:
         ledgers = self._fetch_collection("Ledger")
         stock_items = self._fetch_collection("Stock Item")

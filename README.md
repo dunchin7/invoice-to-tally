@@ -80,6 +80,7 @@ python main.py --input samples/sample_invoice.pdf \
   --tenant-id default \
   --party-fallback manual_review \
   --stock-fallback reject \
+  --ledger-fallback reject \
   --mapping-rules-file validation/config/mapping_rules.json
 ```
 
