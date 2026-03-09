@@ -28,34 +28,32 @@ def _clean_model_output(text: str) -> str:
 
 def _is_transient_error(exc: Exception) -> bool:
     message = str(exc).lower()
-    transient_markers = [
-        "timeout",
-        "timed out",
-        "rate limit",
-        "too many requests",
-        "service unavailable",
-        "temporarily unavailable",
-        "connection",
-        "503",
-        "429",
-    ]
-    return any(marker in message for marker in transient_markers)
+    return any(
+        marker in message
+        for marker in (
+            "timeout",
+            "timed out",
+            "rate limit",
+            "too many requests",
+            "service unavailable",
+            "temporarily unavailable",
+            "connection",
+            "503",
+            "429",
+        )
+    )
 
 
 def _run_with_retry(action: Callable[[], str], action_name: str) -> tuple[str, int, list[str]]:
     errors: list[str] = []
-
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
             return action(), attempt, errors
         except Exception as exc:
-            err = f"{action_name} attempt {attempt} failed: {exc}"
-            errors.append(err)
+            errors.append(f"{action_name} attempt {attempt} failed: {exc}")
             if attempt >= RETRY_ATTEMPTS or not _is_transient_error(exc):
                 raise
-            sleep_seconds = RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
-            time.sleep(sleep_seconds)
-
+            time.sleep(RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)))
     raise RuntimeError(f"Retry loop exhausted for {action_name}")
 
 
@@ -66,23 +64,7 @@ def _parse_json_strict(payload: str) -> dict[str, Any]:
     return parsed
 
 
-def _compute_completeness_score(data: dict[str, Any]) -> tuple[float, int, int]:
-    checks = [
-        data.get("invoice_number"),
-        data.get("invoice_date"),
-        data.get("subtotal"),
-        data.get("tax"),
-        data.get("total"),
-        data.get("currency"),
-        data.get("seller", {}).get("name") if isinstance(data.get("seller"), dict) else "",
-        data.get("buyer", {}).get("name") if isinstance(data.get("buyer"), dict) else "",
-    ]
-    present = sum(
-        1
-        for item in checks
-        if (isinstance(item, str) and item.strip()) or isinstance(item, (int, float))
-    )
-def _compute_confidence(data: dict[str, Any]) -> dict[str, Any]:
+def _compute_completeness_score(data: dict[str, Any]) -> tuple[float, int, int, dict[str, bool]]:
     def _is_numeric_string(value: str) -> bool:
         return bool(re.fullmatch(r"[+-]?(?:\d+\.?\d*|\d*\.\d+)", value.strip()))
 
@@ -90,7 +72,6 @@ def _compute_confidence(data: dict[str, Any]) -> dict[str, Any]:
         value: Any,
         *,
         allow_numeric: bool = False,
-        allow_bool: bool = False,
         allow_collection: bool = False,
         allow_numeric_string: bool = False,
     ) -> bool:
@@ -100,9 +81,7 @@ def _compute_confidence(data: dict[str, Any]) -> dict[str, Any]:
             cleaned = value.strip()
             if not cleaned:
                 return False
-            return allow_numeric_string and _is_numeric_string(cleaned) or not allow_numeric_string
-        if isinstance(value, bool):
-            return allow_bool
+            return _is_numeric_string(cleaned) if allow_numeric_string else True
         if isinstance(value, (int, float)):
             return allow_numeric
         if allow_collection and isinstance(value, (dict, list, tuple)):
@@ -112,56 +91,29 @@ def _compute_confidence(data: dict[str, Any]) -> dict[str, Any]:
     line_items = data.get("line_items")
     has_line_items = _is_present(line_items, allow_collection=True)
     has_line_item_totals = isinstance(line_items, list) and any(
-        _is_present(
-            item.get("total_price") if isinstance(item, dict) else None,
-            allow_numeric=True,
-            allow_numeric_string=True,
-        )
-        or _is_present(
-            item.get("taxable_value") if isinstance(item, dict) else None,
-            allow_numeric=True,
-            allow_numeric_string=True,
-        )
-        or _is_present(
-            item.get("tax_amount") if isinstance(item, dict) else None,
-            allow_numeric=True,
-            allow_numeric_string=True,
-        )
+        _is_present(item.get("total_price") if isinstance(item, dict) else None, allow_numeric=True, allow_numeric_string=True)
+        or _is_present(item.get("taxable_value") if isinstance(item, dict) else None, allow_numeric=True, allow_numeric_string=True)
+        or _is_present(item.get("tax_amount") if isinstance(item, dict) else None, allow_numeric=True, allow_numeric_string=True)
         for item in line_items
     )
 
-    checks: list[tuple[str, bool]] = [
-        ("invoice_number", _is_present(data.get("invoice_number"))),
-        ("invoice_date", _is_present(data.get("invoice_date"))),
-        (
-            "subtotal",
-            _is_present(data.get("subtotal"), allow_numeric=True, allow_numeric_string=True),
-        ),
-        (
-            "tax",
-            _is_present(data.get("tax"), allow_numeric=True, allow_numeric_string=True)
-            or _is_present(data.get("taxes"), allow_numeric=True, allow_numeric_string=True),
-        ),
-        ("total", _is_present(data.get("total"), allow_numeric=True, allow_numeric_string=True)),
-        ("currency", _is_present(data.get("currency"))),
-        (
-            "seller",
-            _is_present(data.get("seller"), allow_collection=True)
-            or _is_present(data.get("seller"), allow_bool=True),
-        ),
-        (
-            "buyer",
-            _is_present(data.get("buyer"), allow_collection=True)
-            or _is_present(data.get("buyer"), allow_bool=True),
-        ),
-        ("line_items", has_line_items),
-        ("line_item_totals", has_line_item_totals),
-    ]
-    present = sum(1 for _name, is_present in checks if is_present)
-    total = len(checks)
+    inputs = {
+        "invoice_number": _is_present(data.get("invoice_number")),
+        "invoice_date": _is_present(data.get("invoice_date")),
+        "subtotal": _is_present(data.get("subtotal"), allow_numeric=True, allow_numeric_string=True),
+        "tax": _is_present(data.get("tax"), allow_numeric=True, allow_numeric_string=True)
+        or _is_present(data.get("taxes"), allow_numeric=True, allow_numeric_string=True),
+        "total": _is_present(data.get("total"), allow_numeric=True, allow_numeric_string=True),
+        "currency": _is_present(data.get("currency")),
+        "seller": _is_present(data.get("seller"), allow_collection=True),
+        "buyer": _is_present(data.get("buyer"), allow_collection=True),
+        "line_items": has_line_items,
+        "line_item_totals": has_line_item_totals,
+    }
 
-    overall = round(present / total, 3) if total else 0.0
-    return overall, present, total
+    present = sum(1 for ok in inputs.values() if ok)
+    total = len(inputs)
+    return (round(present / total, 3) if total else 0.0), present, total, inputs
 
 
 def _compute_schema_valid_score(data: dict[str, Any]) -> tuple[float, bool]:
@@ -176,30 +128,21 @@ def _compute_accounting_consistency_score(data: dict[str, Any], tolerance: float
     subtotal = data.get("subtotal")
     tax = data.get("tax")
     total = data.get("total")
-
     if not all(isinstance(value, (int, float)) for value in (subtotal, tax, total)):
         return 0.0
-
-    expected_total = float(subtotal) + float(tax)
-    delta = abs(expected_total - float(total))
-    return 1.0 if delta <= tolerance else 0.0
+    return 1.0 if abs((float(subtotal) + float(tax)) - float(total)) <= tolerance else 0.0
 
 
 def _compute_confidence(
     data: dict[str, Any],
     *,
-    repair_attempted: bool,
-    repair_succeeded: bool,
+    repair_attempted: bool = False,
+    repair_succeeded: bool = False,
 ) -> dict[str, Any]:
-    completeness_score, fields_present, fields_total = _compute_completeness_score(data)
+    completeness_score, fields_present, fields_total, inputs = _compute_completeness_score(data)
     schema_valid_score, schema_valid = _compute_schema_valid_score(data)
     accounting_consistency_score = _compute_accounting_consistency_score(data)
-
-    overall = round(
-        (0.5 * completeness_score) + (0.25 * schema_valid_score) + (0.25 * accounting_consistency_score),
-        3,
-    )
-
+    overall = round((0.5 * completeness_score) + (0.25 * schema_valid_score) + (0.25 * accounting_consistency_score), 3)
     return {
         "overall": overall,
         "method": "weighted_components_v2",
@@ -211,6 +154,7 @@ def _compute_confidence(
         "accounting_consistency_score": accounting_consistency_score,
         "repair_attempted": repair_attempted,
         "repair_succeeded": repair_succeeded,
+        "inputs": inputs,
     }
 
 
@@ -223,7 +167,6 @@ def extract_structured_invoice(raw_text: str, provider: LLMProvider | None = Non
         "parse_strategy": "strict_json",
         "errors": [],
     }
-
     started_at = time.perf_counter()
 
     try:
@@ -233,87 +176,39 @@ def extract_structured_invoice(raw_text: str, provider: LLMProvider | None = Non
         )
         diagnostics["attempts"]["extract"] = extract_attempts
         diagnostics["errors"].extend(extract_errors)
-
         cleaned = _clean_model_output(raw_response)
 
         try:
             data = _parse_json_strict(cleaned)
-            confidence = _compute_confidence(data, repair_attempted=False, repair_succeeded=False)
-            diagnostics["parse_strategy"] = "strict_json"
+            confidence = _compute_confidence(data)
             return {
                 "status": "success",
                 "data": data,
                 "confidence": confidence,
-                "diagnostics": {
-                    **diagnostics,
-                    "confidence_inputs": confidence.get("inputs", {}),
-                    "latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
-                },
+                "diagnostics": {**diagnostics, "confidence_inputs": confidence["inputs"], "latency_ms": round((time.perf_counter() - started_at) * 1000, 2)},
             }
         except json.JSONDecodeError as strict_error:
             diagnostics["errors"].append(f"strict_parse_failed: {strict_error}")
-            diagnostics["parse_strategy"] = "repair_pass"
-
             repaired_response, repair_attempts, repair_errors = _run_with_retry(
                 lambda: selected_provider.repair_json(raw_text, cleaned, str(strict_error)),
                 "repair",
             )
             diagnostics["attempts"]["repair"] = repair_attempts
             diagnostics["errors"].extend(repair_errors)
-
             repaired_cleaned = _clean_model_output(repaired_response)
-            try:
-                repaired_data = _parse_json_strict(repaired_cleaned)
-                confidence = _compute_confidence(repaired_data, repair_attempted=True, repair_succeeded=True)
-                diagnostics["parse_strategy"] = "repaired_json"
-                return {
-                    "status": "success",
-                    "data": repaired_data,
-                    "confidence": confidence,
-                    "diagnostics": {
-                        **diagnostics,
-                        "confidence_inputs": confidence.get("inputs", {}),
-                        "latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
-                    },
-                }
-            except json.JSONDecodeError as repaired_error:
-                diagnostics["errors"].append(f"repair_parse_failed: {repaired_error}")
-                diagnostics["parse_strategy"] = "failed"
-                return {
-                    "status": "error",
-                    "error": {
-                        "code": "JSON_REPAIR_FAILED",
-                        "message": "Failed to parse model output as JSON after repair pass",
-                        "raw_response_excerpt": repaired_cleaned[:500],
-                    },
-                    "data": None,
-                    "confidence": {
-                        "overall": 0.0,
-                        "method": "weighted_components_v2",
-                        "fields_present": 0,
-                        "fields_total": 0,
-                        "completeness_score": 0.0,
-                        "schema_valid_score": 0.0,
-                        "schema_valid": False,
-                        "accounting_consistency_score": 0.0,
-                        "repair_attempted": True,
-                        "repair_succeeded": False,
-                    },
-                    "diagnostics": {
-                        **diagnostics,
-                        "latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
-                    },
-                }
-
+            repaired_data = _parse_json_strict(repaired_cleaned)
+            confidence = _compute_confidence(repaired_data, repair_attempted=True, repair_succeeded=True)
+            return {
+                "status": "success",
+                "data": repaired_data,
+                "confidence": confidence,
+                "diagnostics": {**diagnostics, "parse_strategy": "repaired_json", "confidence_inputs": confidence["inputs"], "latency_ms": round((time.perf_counter() - started_at) * 1000, 2)},
+            }
     except Exception as exc:
         diagnostics["errors"].append(f"provider_failure: {exc}")
-        diagnostics["parse_strategy"] = "failed"
         return {
             "status": "error",
-            "error": {
-                "code": "PROVIDER_FAILURE",
-                "message": str(exc),
-            },
+            "error": {"code": "PROVIDER_FAILURE", "message": str(exc)},
             "data": None,
             "confidence": {
                 "overall": 0.0,
@@ -324,20 +219,9 @@ def extract_structured_invoice(raw_text: str, provider: LLMProvider | None = Non
                 "schema_valid_score": 0.0,
                 "schema_valid": False,
                 "accounting_consistency_score": 0.0,
-                "repair_attempted": False,
+                "repair_attempted": diagnostics["attempts"]["repair"] > 0,
                 "repair_succeeded": False,
+                "inputs": {},
             },
-            "diagnostics": {
-                **diagnostics,
-                "latency_ms": round((time.perf_counter() - started_at) * 1000, 2),
-            },
+            "diagnostics": {**diagnostics, "parse_strategy": "failed", "latency_ms": round((time.perf_counter() - started_at) * 1000, 2)},
         }
-
-
-def extract_invoice_fields(raw_text: str) -> dict[str, Any]:
-    """Backward-compatible helper for callers expecting only extracted data."""
-    result = extract_structured_invoice(raw_text)
-    if result.get("status") != "success":
-        message = result.get("error", {}).get("message", "Unknown extraction error")
-        raise RuntimeError(message)
-    return result["data"]

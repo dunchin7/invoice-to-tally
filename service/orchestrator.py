@@ -61,6 +61,10 @@ class InvoiceOrchestrator:
         self.idempotency_lock_path = self.base_path / "idempotency_store.lock"
         self.review_queue_path = self.base_path / "manual_review_queue.jsonl"
 
+    @staticmethod
+    def _build_tally_client(base_url: str) -> TallyClient:
+        return TallyClient(TallyClientConfig(base_url=base_url))
+
     def process_invoice(
         self,
         input_path: str,
@@ -260,24 +264,10 @@ class InvoiceOrchestrator:
                 }
                 self._write_json_atomic(self.idempotency_store_path, idempotency_store)
 
-            if outcome == "manual_review":
-                queue_payload = {
-                    "job_id": job_id,
-                    "invoice_number": resolved_payload.get("invoice_number"),
-                    "confidence": extraction_confidence,
-                    "critical_failure": normalization.report.critical_failure,
-                    "reason": "tally_rejected",
-                    "tally_response": upload_response,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-                self._append_jsonl(self.review_queue_path, queue_payload)
-                record["review_queue_entry"] = queue_payload
-                transition(InvoiceJobState.REVIEW_REQUIRED, "system:tally_post_manual_review", queue_payload)
-                return record
             transition(
-                InvoiceJobState.FAILED,
-                "system:tally_post_failed",
-                {"posting_status": "failure", "tally_response": upload_response},
+                InvoiceJobState.POSTED,
+                "system:tally_posted",
+                {"posting_status": "success", "tally_response": upload_response},
             )
             return record
 
