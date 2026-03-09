@@ -61,6 +61,10 @@ class InvoiceOrchestrator:
         self.idempotency_lock_path = self.base_path / "idempotency_store.lock"
         self.review_queue_path = self.base_path / "manual_review_queue.jsonl"
 
+    @staticmethod
+    def _build_tally_client(base_url: str) -> TallyClient:
+        return TallyClient(TallyClientConfig(base_url=base_url))
+
     def process_invoice(
         self,
         input_path: str,
@@ -294,7 +298,11 @@ class InvoiceOrchestrator:
                     }
                     self._write_json_atomic(self.idempotency_store_path, idempotency_store)
 
-            transition(state, action, upload_response)
+            transition(
+                InvoiceJobState.POSTED,
+                "system:tally_posted",
+                {"posting_status": "success", "tally_response": upload_response},
+            )
             return record
 
         except (SchemaValidationError, FieldNormalizationError) as exc:
