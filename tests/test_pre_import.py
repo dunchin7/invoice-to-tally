@@ -122,6 +122,101 @@ def test_master_data_client_collection_accessors_read_cache(tmp_path):
     assert client.get_stock_item_masters()[0].name == "S"
 
 
+def test_preimport_learns_on_approval_when_enabled(tmp_path):
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text(
+        json.dumps(
+            {
+                "global": {"party": {}, "ledger": {}, "stock_item": {}},
+                "tenants": {"default": {"party": {}, "ledger": {}, "stock_item": {}}},
+                "settings": {"global": {"learn_rule_on_approval": True}, "tenants": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolver = PreImportResolver(
+        _master_data(),
+        MappingRuleStore(json_path=str(rules_path)),
+        fallback_policy={"ledger": "auto_create"},
+    )
+    report = resolver.resolve_invoice(
+        {"buyer": "ACME CORPORATION", "seller": "Unmapped Ledger", "line_items": []},
+        tenant_id="default",
+        approved=True,
+        approved_by="reviewer-1",
+    )
+
+    assert len(report.learned_rules) == 1
+    learned = report.learned_rules[0]
+    assert learned["learned"] is True
+    assert learned["duplicate"] is False
+    assert learned["stored_in"] == "json"
+
+    payload = json.loads(rules_path.read_text(encoding="utf-8"))
+    assert payload["tenants"]["default"]["ledger"]["unmapped ledger"]["value"] == "Unmapped Ledger"
+    assert payload["tenants"]["default"]["ledger"]["unmapped ledger"]["provenance"]["approved_by"] == "reviewer-1"
+
+
+def test_preimport_does_not_learn_when_disabled(tmp_path):
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text(
+        json.dumps(
+            {
+                "global": {"party": {}, "ledger": {}, "stock_item": {}},
+                "tenants": {"default": {"party": {}, "ledger": {}, "stock_item": {}}},
+                "settings": {"global": {"learn_rule_on_approval": False}, "tenants": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolver = PreImportResolver(
+        _master_data(),
+        MappingRuleStore(json_path=str(rules_path)),
+        fallback_policy={"ledger": "auto_create"},
+    )
+    report = resolver.resolve_invoice(
+        {"buyer": "ACME CORPORATION", "seller": "Unmapped Ledger", "line_items": []},
+        tenant_id="default",
+        approved=True,
+    )
+
+    assert report.learned_rules == ()
+    payload = json.loads(rules_path.read_text(encoding="utf-8"))
+    assert payload["tenants"]["default"]["ledger"] == {}
+
+
+def test_preimport_learning_is_idempotent_for_duplicate_approvals(tmp_path):
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text(
+        json.dumps(
+            {
+                "global": {"party": {}, "ledger": {}, "stock_item": {}},
+                "tenants": {"default": {"party": {}, "ledger": {}, "stock_item": {}}},
+                "settings": {"global": {"learn_rule_on_approval": True}, "tenants": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = MappingRuleStore(json_path=str(rules_path))
+    resolver = PreImportResolver(_master_data(), store, fallback_policy={"ledger": "auto_create"})
+
+    first = resolver.resolve_invoice(
+        {"buyer": "ACME CORPORATION", "seller": "Unmapped Ledger", "line_items": []},
+        tenant_id="default",
+        approved=True,
+    )
+    second = resolver.resolve_invoice(
+        {"buyer": "ACME CORPORATION", "seller": "Unmapped Ledger", "line_items": []},
+        tenant_id="default",
+        approved=True,
+    )
+
+    assert first.learned_rules[0]["learned"] is True
+    assert second.learned_rules[0]["learned"] is False
+    assert second.learned_rules[0]["duplicate"] is True
 def test_top_suggestions_improves_ocr_noisy_vendor_ranking():
     records = (
         TallyMasterRecord(name="GLOBAL SOLUTIONS LLP", code="L001", aliases=("Global Sol",)),

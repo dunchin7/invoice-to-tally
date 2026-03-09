@@ -18,5 +18,11 @@
       "ledger": {},
       "stock_item": {}
     }
+  },
+  "settings": {
+    "global": {
+      "learn_rule_on_approval": false
+    },
+    "tenants": {}
   }
 }
