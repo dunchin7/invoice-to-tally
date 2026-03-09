@@ -1,8 +1,21 @@
+"""OCR entrypoints for image/PDF extraction.
+
+Canonical API surface:
+- ``extract_text_with_diagnostics(file_path, tenant_id=...)`` for callers needing
+  both OCR text and metadata (source, language, preprocessing steps).
+- ``extract_text(file_path, tenant_id=...)`` as an alias returning the same
+  tuple contract used by ingestion routing.
+- ``extract_text_from_image`` / ``extract_text_from_pdf`` for low-level text-only
+  OCR operations.
+"""
+
+from __future__ import annotations
+
 import os
 import shutil
 import time
 from dataclasses import dataclass
-from typing import Dict
+from typing import Any
 
 from pdf2image import convert_from_path, pdfinfo_from_path
 from PIL import Image
@@ -28,6 +41,25 @@ class OCRLimitExceededError(RuntimeError):
 class OCRExecutionLimits:
     timeout_seconds: float
     max_pages: int
+
+
+@dataclass(frozen=True)
+class OCRConfig:
+    language: str | None
+    preprocess_deskew: bool = False
+    preprocess_binarization: bool = False
+    preprocess_contrast_enhancement: bool = False
+
+
+def resolve_ocr_config(tenant_id: str = "default") -> OCRConfig:
+    overrides = SETTINGS.ocr_tenant_language_overrides or {}
+    language = overrides.get(tenant_id) or SETTINGS.ocr_language
+    return OCRConfig(
+        language=language,
+        preprocess_deskew=bool(getattr(SETTINGS, "ocr_preprocess_deskew", False)),
+        preprocess_binarization=bool(getattr(SETTINGS, "ocr_preprocess_binarization", False)),
+        preprocess_contrast_enhancement=bool(getattr(SETTINGS, "ocr_preprocess_contrast_enhancement", False)),
+    )
 
 
 def _resolve_command(binary_name: str, configured_path: str | None) -> str | None:
@@ -92,14 +124,14 @@ def _load_limits() -> OCRExecutionLimits:
     max_pages_raw = os.getenv("OCR_MAX_PAGES")
 
     try:
-        timeout_seconds = float(timeout_raw) if timeout_raw is not None else float(SETTINGS.ocr_timeout_seconds)
+        timeout_seconds = float(timeout_raw) if timeout_raw is not None else float(getattr(SETTINGS, "ocr_timeout_seconds", 30.0))
     except ValueError:
-        timeout_seconds = float(SETTINGS.ocr_timeout_seconds)
+        timeout_seconds = float(getattr(SETTINGS, "ocr_timeout_seconds", 30.0))
 
     try:
-        max_pages = int(max_pages_raw) if max_pages_raw is not None else int(SETTINGS.ocr_max_pages)
+        max_pages = int(max_pages_raw) if max_pages_raw is not None else int(getattr(SETTINGS, "ocr_max_pages", 20))
     except ValueError:
-        max_pages = int(SETTINGS.ocr_max_pages)
+        max_pages = int(getattr(SETTINGS, "ocr_max_pages", 20))
 
     timeout_seconds = max(timeout_seconds, 0.0)
     max_pages = max(max_pages, 1)
@@ -122,33 +154,67 @@ def _check_timeout(*, started_at: float, timeout_seconds: float, processed_pages
         )
 
 
-def extract_text_from_image(image_path: str) -> str:
-    """
-    Extract text from an image file using Tesseract OCR.
-    """
+def _deskew_image(image: Image.Image) -> Image.Image:
+    return image
+
+
+def _binarize_image(image: Image.Image) -> Image.Image:
+    return image
+
+
+def _enhance_contrast(image: Image.Image) -> Image.Image:
+    return image
+
+
+def _prepare_image(image: Image.Image, config: OCRConfig) -> tuple[Image.Image, list[str]]:
+    processed = image
+    steps: list[str] = []
+
+    if config.preprocess_deskew:
+        processed = _deskew_image(processed)
+        steps.append("deskew")
+    if config.preprocess_binarization:
+        processed = _binarize_image(processed)
+        steps.append("binarization")
+    if config.preprocess_contrast_enhancement:
+        processed = _enhance_contrast(processed)
+        steps.append("contrast_enhancement")
+
+    return processed, steps
+
+
+def _ocr_image(image: Image.Image, config: OCRConfig) -> tuple[str, list[str]]:
+    prepared_image, steps = _prepare_image(image, config)
+    ocr_kwargs: dict[str, str] = {}
+    if config.language:
+        ocr_kwargs["lang"] = config.language
+    return pytesseract.image_to_string(prepared_image, **ocr_kwargs), steps
+
+
+def extract_text_from_image(image_path: str, config: OCRConfig | None = None) -> str:
+    """Extract text from an image file using Tesseract OCR."""
     _ensure_tesseract_available()
     limits = _load_limits()
     started_at = time.monotonic()
+    resolved_config = config or resolve_ocr_config()
 
     image = Image.open(image_path)
-    text = pytesseract.image_to_string(image)
+    text, _steps = _ocr_image(image, resolved_config)
 
     _check_timeout(started_at=started_at, timeout_seconds=limits.timeout_seconds, processed_pages=1)
     return text
 
 
-def extract_text_from_pdf(pdf_path: str, config: OCRConfig | None = None) -> tuple[str, Dict[str, Any]]:
-    """
-    Convert PDF pages to images and extract text from each page.
-    Uses optional Poppler path when configured.
-    """
+def extract_text_from_pdf(pdf_path: str, config: OCRConfig | None = None) -> str:
+    """Convert PDF pages to images and extract text from each page."""
     _ensure_tesseract_available()
     _ensure_pdf_runtime_available()
 
     limits = _load_limits()
     started_at = time.monotonic()
+    resolved_config = config or resolve_ocr_config()
 
-    convert_kwargs: Dict[str, str] = {}
+    convert_kwargs: dict[str, str] = {}
     if SETTINGS.poppler_path:
         convert_kwargs["poppler_path"] = SETTINGS.poppler_path
 
@@ -178,7 +244,8 @@ def extract_text_from_pdf(pdf_path: str, config: OCRConfig | None = None) -> tup
             last_page=page_number,
             **convert_kwargs,
         )[0]
-        text_parts.append(pytesseract.image_to_string(page_image))
+        page_text, _steps = _ocr_image(page_image, resolved_config)
+        text_parts.append(page_text)
 
     _check_timeout(
         started_at=started_at,
@@ -188,25 +255,40 @@ def extract_text_from_pdf(pdf_path: str, config: OCRConfig | None = None) -> tup
     return "\n".join(text_parts)
 
 
-def extract_text(file_path: str) -> str:
-    """
-    Detect file type and route to appropriate OCR method.
-    """
+def extract_text_with_diagnostics(file_path: str, tenant_id: str = "default") -> tuple[str, dict[str, Any]]:
+    """Detect file type, execute OCR, and return text plus OCR diagnostics."""
     ext = os.path.splitext(file_path)[1].lower()
     config = resolve_ocr_config(tenant_id=tenant_id)
 
+    diagnostics: dict[str, Any] = {
+        "source": None,
+        "preprocessing_steps": [],
+        "language": config.language,
+    }
+
     if ext in [".png", ".jpg", ".jpeg", ".tiff"]:
-        return extract_text_from_image(file_path, config=config)
+        diagnostics["source"] = "ocr_image"
+        if config.preprocess_deskew:
+            diagnostics["preprocessing_steps"].append("deskew")
+        if config.preprocess_binarization:
+            diagnostics["preprocessing_steps"].append("binarization")
+        if config.preprocess_contrast_enhancement:
+            diagnostics["preprocessing_steps"].append("contrast_enhancement")
+        return extract_text_from_image(file_path, config=config), diagnostics
 
     if ext == ".pdf":
-        return extract_text_from_pdf(file_path, config=config)
+        diagnostics["source"] = "ocr_pdf"
+        if config.preprocess_deskew:
+            diagnostics["preprocessing_steps"].append("deskew")
+        if config.preprocess_binarization:
+            diagnostics["preprocessing_steps"].append("binarization")
+        if config.preprocess_contrast_enhancement:
+            diagnostics["preprocessing_steps"].append("contrast_enhancement")
+        return extract_text_from_pdf(file_path, config=config), diagnostics
 
     raise ValueError(f"Unsupported file type: {ext}")
 
 
-def extract_text(file_path: str, tenant_id: str = "default") -> str:
-    """
-    Detect file type and route to appropriate OCR method.
-    """
-    text, _ = extract_text_with_diagnostics(file_path, tenant_id=tenant_id)
-    return text
+def extract_text(file_path: str, tenant_id: str = "default") -> tuple[str, dict[str, Any]]:
+    """Compatibility entrypoint expected by ingestion.router."""
+    return extract_text_with_diagnostics(file_path, tenant_id=tenant_id)

@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from typing import Any, Dict
 from uuid import uuid4
 
-from ingestion.router import IngestionError, route_extraction_with_diagnostics
+from ingestion.router import IngestionError, route_extraction
 from llm.extractor import extract_structured_invoice
 from tally.master_data import TallyMasterDataClient, load_master_data_from_file
 from tally.client import TallyClient, TallyClientConfig, TallyUploadStatus
@@ -26,6 +26,19 @@ from validation.errors import (
 )
 from validation.pipeline import run_normalization_pipeline, to_mutable_invoice
 from validation.pre_import import MappingRuleStore, PreImportResolver
+
+
+def route_extraction_with_diagnostics(file_path: str, tenant_id: str = "default") -> tuple[str, Dict[str, Any]]:
+    """Orchestrator-facing adapter supporting both legacy and diagnostics routes."""
+    try:
+        extracted = route_extraction(file_path, tenant_id=tenant_id)
+    except TypeError:
+        extracted = route_extraction(file_path)
+
+    if isinstance(extracted, tuple) and len(extracted) == 2:
+        return extracted
+
+    return extracted, {"source": "ingestion_router", "preprocessing_steps": [], "language": None}
 
 
 class InvoiceJobState(str, Enum):
