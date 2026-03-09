@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from service.orchestrator import InvoiceJobState, InvoiceOrchestrator
+from tally.client import TallyUploadStatus
 from validation.errors import AccountingValidationError, FieldNormalizationError
 
 
@@ -77,6 +79,10 @@ def _patch_pipeline(monkeypatch, *, confidence=0.95, blocking=False):
         "service.orchestrator.PreImportResolver",
         lambda **_kwargs: _Resolver(_PreImportReport(normalized, blocking=blocking, issues=[_Issue()] if blocking else [])),
     )
+    monkeypatch.setattr(
+        "service.orchestrator.generate_tally_xml",
+        lambda _invoice, path: Path(path).write_text("<ENVELOPE/>", encoding="utf-8"),
+    )
 
 
 def test_blocking_validation_routes_to_manual_review(tmp_path, monkeypatch):
@@ -97,8 +103,16 @@ def test_idempotency_prevents_duplicate_posting(tmp_path, monkeypatch):
 
     def _generate_xml(_invoice, path):
         generated.append(path)
+        Path(path).write_text("<ENVELOPE/>", encoding="utf-8")
+
+    class _Client:
+        endpoint = "http://localhost:9000"
+
+        def upload_xml(self, _xml_body):
+            return TallyUploadStatus(ok=True, endpoint=self.endpoint, created=1, raw_response="<ok/>", message="ok")
 
     monkeypatch.setattr("service.orchestrator.generate_tally_xml", _generate_xml)
+    monkeypatch.setattr("service.orchestrator.InvoiceOrchestrator._build_tally_client", lambda *_a, **_k: _Client())
 
     orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
     first = orchestrator.process_invoice(input_path="invoice.pdf", master_data_file="master.json")
@@ -132,6 +146,10 @@ def test_reconciliation_payload_includes_rule_learning_summary(tmp_path, monkeyp
         "service.orchestrator.PreImportResolver",
         lambda **_kwargs: _Resolver(_PreImportReport(normalized, blocking=False, issues=[], learned_rules=learned)),
     )
+    monkeypatch.setattr(
+        "service.orchestrator.InvoiceOrchestrator._build_tally_client",
+        lambda *_a, **_k: type("Client", (), {"endpoint": "http://localhost:9000", "upload_xml": lambda self, _xml: TallyUploadStatus(ok=True, endpoint=self.endpoint, created=1, raw_response="<ok/>", message="ok")})(),
+    )
 
     orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
     result = orchestrator.process_invoice(
@@ -148,6 +166,89 @@ def test_reconciliation_payload_includes_rule_learning_summary(tmp_path, monkeyp
     assert learning["enabled"] is True
     assert learning["learned"] is True
     assert learning["stored_in"] == ["sqlite"]
+
+
+def test_dry_run_generates_xml_and_skips_remote_post(tmp_path, monkeypatch):
+    _patch_pipeline(monkeypatch, blocking=False)
+
+    class _Client:
+        endpoint = "http://localhost:9000"
+
+        def upload_xml(self, _xml_body):
+            raise AssertionError("upload_xml should not be called for dry run")
+
+    monkeypatch.setattr("service.orchestrator.InvoiceOrchestrator._build_tally_client", lambda *_a, **_k: _Client())
+
+    orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
+    result = orchestrator.process_invoice(input_path="invoice.pdf", master_data_file="master.json", dry_run=True)
+
+    assert result["state"] == InvoiceJobState.DRY_RUN.value
+    assert "upload_request" not in result["artifacts"]
+    with open(result["artifacts"]["upload_response"], "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    assert payload["status"] == "dry_run"
+
+
+def test_tally_success_transitions_to_posted(tmp_path, monkeypatch):
+    _patch_pipeline(monkeypatch, blocking=False)
+
+    class _Client:
+        endpoint = "http://localhost:9000"
+
+        def upload_xml(self, _xml_body):
+            return TallyUploadStatus(ok=True, endpoint=self.endpoint, created=1, raw_response="<ok/>", message="ok")
+
+    monkeypatch.setattr("service.orchestrator.InvoiceOrchestrator._build_tally_client", lambda *_a, **_k: _Client())
+
+    orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
+    result = orchestrator.process_invoice(input_path="invoice.pdf", master_data_file="master.json")
+
+    assert result["state"] == InvoiceJobState.POSTED.value
+    assert "upload_request" in result["artifacts"]
+
+
+def test_tally_retryable_error_transitions_to_retry_pending(tmp_path, monkeypatch):
+    _patch_pipeline(monkeypatch, blocking=False)
+
+    class _Client:
+        endpoint = "http://localhost:9000"
+
+        def upload_xml(self, _xml_body):
+            return TallyUploadStatus(ok=False, endpoint=self.endpoint, raw_response="", message="connection failed")
+
+    monkeypatch.setattr("service.orchestrator.InvoiceOrchestrator._build_tally_client", lambda *_a, **_k: _Client())
+
+    orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
+    result = orchestrator.process_invoice(input_path="invoice.pdf", master_data_file="master.json")
+
+    assert result["state"] == InvoiceJobState.RETRY_PENDING.value
+
+
+def test_tally_hard_failure_routes_to_manual_review(tmp_path, monkeypatch):
+    _patch_pipeline(monkeypatch, blocking=False)
+
+    class _Client:
+        endpoint = "http://localhost:9000"
+
+        def upload_xml(self, _xml_body):
+            return TallyUploadStatus(
+                ok=False,
+                endpoint=self.endpoint,
+                errors=1,
+                line_errors=("Voucher type invalid",),
+                raw_response="<error/>",
+                message="Import failed",
+            )
+
+    monkeypatch.setattr("service.orchestrator.InvoiceOrchestrator._build_tally_client", lambda *_a, **_k: _Client())
+
+    orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
+    result = orchestrator.process_invoice(input_path="invoice.pdf", master_data_file="master.json")
+
+    assert result["state"] == InvoiceJobState.REVIEW_REQUIRED.value
+    assert result["review_queue_entry"]["reason"] == "tally_rejected"
+
+
 def test_schema_or_normalization_error_sets_structured_failure(tmp_path, monkeypatch):
     _patch_pipeline(monkeypatch, blocking=False)
     monkeypatch.setattr(
