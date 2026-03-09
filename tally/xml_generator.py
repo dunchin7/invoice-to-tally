@@ -1,4 +1,3 @@
-from xml.etree.ElementTree import Element, ElementTree, SubElement, tostring
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,7 +5,6 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Callable
 from xml.etree.ElementTree import Element, ElementTree, SubElement
-
 
 TWOPLACES = Decimal("0.01")
 DEFAULT_LEDGER_NAMES = {
@@ -70,8 +68,18 @@ def _party_ledger_name(party: Any) -> str:
 
 
 def _normalize_tally_date(invoice_date: str) -> str:
-    parsed = datetime.strptime(invoice_date, "%Y-%m-%d")
-    return parsed.strftime("%Y%m%d")
+    if isinstance(invoice_date, datetime):
+        return invoice_date.strftime("%Y%m%d")
+
+    date_text = str(invoice_date).strip()
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            parsed = datetime.strptime(date_text, fmt)
+            return parsed.strftime("%Y%m%d")
+        except ValueError:
+            continue
+
+    raise ValueError(f"Unsupported invoice_date format: {invoice_date}")
 
 
 def _resolve_voucher_type(invoice: dict[str, Any], config: dict[str, Any]) -> str:
@@ -99,21 +107,12 @@ def _build_ledger_resolver(config: dict[str, Any]) -> LedgerResolver:
 
 
 def _collect_amounts(invoice: dict[str, Any]) -> dict[str, Decimal]:
-    line_items = invoice.get("line_items", [])
-
-def build_tally_xml(
-    invoice: dict,
-    *,
-    company: str | None = None,
-    voucher_type: str = "Sales",
-    voucher_action: str = "Create",
-) -> str:
     taxable = Decimal("0")
     cgst = Decimal("0")
     sgst = Decimal("0")
     igst = Decimal("0")
 
-    for item in line_items:
+    for item in invoice.get("line_items", []):
         item_total = _to_decimal(item.get("total_price"))
         item_tax = _to_decimal(item.get("tax_amount"))
         item_taxable = _to_decimal(item.get("taxable_value"), default="-1")
@@ -127,9 +126,8 @@ def build_tally_xml(
         igst += _to_decimal(item.get("igst_amount"))
 
     if not any([cgst, sgst, igst]):
-        tax_total = _to_decimal(invoice.get("tax"))
-        # Fallback: when only total tax is known, treat as IGST.
-        igst = tax_total
+        # Fallback: when item-level split tax is not present.
+        igst = _to_decimal(invoice.get("tax"))
 
     total = _to_decimal(invoice.get("total"))
     computed_credit = taxable + cgst + sgst + igst
@@ -165,7 +163,11 @@ def map_invoice_to_voucher(invoice: dict[str, Any], config: dict[str, Any] | Non
 
     entries: list[VoucherLedgerEntry] = [
         VoucherLedgerEntry(ledger_name=receivables_ledger, amount=amounts["total"], entry_type="debit"),
-        VoucherLedgerEntry(ledger_name=ledger_resolver("sales", invoice), amount=amounts["taxable"], entry_type="credit"),
+        VoucherLedgerEntry(
+            ledger_name=ledger_resolver("sales", invoice),
+            amount=amounts["taxable"],
+            entry_type="credit",
+        ),
     ]
 
     for tax_role in ("cgst", "sgst", "igst"):
@@ -208,7 +210,13 @@ def map_invoice_to_voucher(invoice: dict[str, Any], config: dict[str, Any] | Non
     )
 
 
-def serialize_voucher_mapping(voucher_mapping: VoucherMapping, output_path: str) -> None:
+def serialize_voucher_mapping(
+    voucher_mapping: VoucherMapping,
+    output_path: str,
+    *,
+    company: str | None = None,
+    voucher_action: str = "Create",
+) -> None:
     envelope = Element("ENVELOPE")
 
     header = SubElement(envelope, "HEADER")
@@ -227,54 +235,12 @@ def serialize_voucher_mapping(voucher_mapping: VoucherMapping, output_path: str)
     requestdata = SubElement(importdata, "REQUESTDATA")
     tallymessage = SubElement(requestdata, "TALLYMESSAGE")
 
-    voucher = SubElement(tallymessage, "VOUCHER", VCHTYPE=voucher_type, ACTION=voucher_action)
-
-    SubElement(voucher, "DATE").text = invoice["invoice_date"]
-    SubElement(voucher, "VOUCHERNUMBER").text = invoice["invoice_number"]
-    buyer_ledger = _party_ledger_name(invoice.get("buyer"))
-    SubElement(voucher, "PARTYLEDGERNAME").text = buyer_ledger
-    SubElement(voucher, "NARRATION").text = "Imported from Invoice AI"
-
-    for item in invoice["line_items"]:
-        ledger_entry = SubElement(voucher, "ALLLEDGERENTRIES.LIST")
-
-        SubElement(ledger_entry, "LEDGERNAME").text = "Sales"
-        SubElement(ledger_entry, "ISDEEMEDPOSITIVE").text = "No"
-        SubElement(ledger_entry, "AMOUNT").text = str(item["total_price"])
-
-    if invoice.get("tax", 0) > 0:
-        tax_entry = SubElement(voucher, "ALLLEDGERENTRIES.LIST")
-
-        SubElement(tax_entry, "LEDGERNAME").text = "Tax"
-        SubElement(tax_entry, "ISDEEMEDPOSITIVE").text = "No"
-        SubElement(tax_entry, "AMOUNT").text = str(invoice["tax"])
-
-    party_entry = SubElement(voucher, "ALLLEDGERENTRIES.LIST")
-
-    SubElement(party_entry, "LEDGERNAME").text = buyer_ledger
-    SubElement(party_entry, "ISDEEMEDPOSITIVE").text = "Yes"
-    SubElement(party_entry, "AMOUNT").text = str(invoice["total"])
-
-    return tostring(envelope, encoding="utf-8", xml_declaration=True).decode("utf-8")
-
-
-def generate_tally_xml(
-    invoice: dict,
-    output_path: str,
-    *,
-    company: str | None = None,
-    voucher_type: str = "Sales",
-    voucher_action: str = "Create",
-):
-    xml_content = build_tally_xml(
-        invoice,
-        company=company,
-        voucher_type=voucher_type,
-        voucher_action=voucher_action,
+    voucher = SubElement(
+        tallymessage,
+        "VOUCHER",
+        VCHTYPE=voucher_mapping.voucher_type,
+        ACTION=voucher_action,
     )
-    with open(output_path, "w", encoding="utf-8") as output_file:
-        output_file.write(xml_content)
-    voucher = SubElement(tallymessage, "VOUCHER", VCHTYPE=voucher_mapping.voucher_type, ACTION="Create")
 
     SubElement(voucher, "DATE").text = voucher_mapping.date
     SubElement(voucher, "VOUCHERNUMBER").text = voucher_mapping.voucher_number
@@ -284,13 +250,27 @@ def generate_tally_xml(
     for entry in voucher_mapping.entries:
         ledger_entry = SubElement(voucher, "ALLLEDGERENTRIES.LIST")
         SubElement(ledger_entry, "LEDGERNAME").text = entry.ledger_name
-        SubElement(ledger_entry, "ISDEEMEDPOSITIVE").text = "Yes" if entry.entry_type == "debit" else "No"
-        SubElement(ledger_entry, "AMOUNT").text = f"{entry.amount:.2f}"
+        is_deemed_positive = "Yes" if entry.entry_type == "debit" else "No"
+        SubElement(ledger_entry, "ISDEEMEDPOSITIVE").text = is_deemed_positive
+        amount_text = str(entry.amount if entry.entry_type == "credit" else -entry.amount)
+        SubElement(ledger_entry, "AMOUNT").text = amount_text
 
     tree = ElementTree(envelope)
     tree.write(output_path, encoding="utf-8", xml_declaration=True)
 
 
-def generate_tally_xml(invoice: dict[str, Any], output_path: str, config: dict[str, Any] | None = None) -> None:
-    voucher_mapping = map_invoice_to_voucher(invoice, config=config)
-    serialize_voucher_mapping(voucher_mapping, output_path)
+def generate_tally_xml(
+    invoice: dict[str, Any],
+    output_path: str,
+    *,
+    config: dict[str, Any] | None = None,
+    company: str | None = None,
+    voucher_action: str = "Create",
+) -> None:
+    mapping = map_invoice_to_voucher(invoice, config=config)
+    serialize_voucher_mapping(
+        mapping,
+        output_path,
+        company=company,
+        voucher_action=voucher_action,
+    )
