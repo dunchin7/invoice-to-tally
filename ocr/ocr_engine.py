@@ -1,10 +1,11 @@
 import os
 import shutil
+import time
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Dict
 
-from pdf2image import convert_from_path
-from PIL import Image, ImageEnhance, ImageOps
+from pdf2image import convert_from_path, pdfinfo_from_path
+from PIL import Image
 import pytesseract
 
 from settings import SETTINGS
@@ -14,12 +15,19 @@ _tesseract_runtime_validated = False
 _pdf_runtime_validated = False
 
 
+class OCRLimitExceededError(RuntimeError):
+    """Raised when OCR execution exceeds configured operational limits."""
+
+    def __init__(self, message: str, *, code: str, context: dict[str, object] | None = None):
+        super().__init__(message)
+        self.code = code
+        self.context = context or {}
+
+
 @dataclass(frozen=True)
-class OCRConfig:
-    preprocess_deskew: bool = False
-    preprocess_binarization: bool = False
-    preprocess_contrast_enhancement: bool = False
-    language: str | None = None
+class OCRExecutionLimits:
+    timeout_seconds: float
+    max_pages: int
 
 
 def _resolve_command(binary_name: str, configured_path: str | None) -> str | None:
@@ -79,73 +87,54 @@ def _ensure_pdf_runtime_available() -> None:
     _pdf_runtime_validated = True
 
 
-def resolve_ocr_config(tenant_id: str = "default") -> OCRConfig:
-    tenant_overrides = SETTINGS.ocr_tenant_language_overrides or {}
-    language = tenant_overrides.get(tenant_id) or SETTINGS.ocr_language
-    return OCRConfig(
-        preprocess_deskew=SETTINGS.ocr_preprocess_deskew,
-        preprocess_binarization=SETTINGS.ocr_preprocess_binarization,
-        preprocess_contrast_enhancement=SETTINGS.ocr_preprocess_contrast_enhancement,
-        language=language,
-    )
+def _load_limits() -> OCRExecutionLimits:
+    timeout_raw = os.getenv("OCR_TIMEOUT_SECONDS")
+    max_pages_raw = os.getenv("OCR_MAX_PAGES")
+
+    try:
+        timeout_seconds = float(timeout_raw) if timeout_raw is not None else float(SETTINGS.ocr_timeout_seconds)
+    except ValueError:
+        timeout_seconds = float(SETTINGS.ocr_timeout_seconds)
+
+    try:
+        max_pages = int(max_pages_raw) if max_pages_raw is not None else int(SETTINGS.ocr_max_pages)
+    except ValueError:
+        max_pages = int(SETTINGS.ocr_max_pages)
+
+    timeout_seconds = max(timeout_seconds, 0.0)
+    max_pages = max(max_pages, 1)
+    return OCRExecutionLimits(timeout_seconds=timeout_seconds, max_pages=max_pages)
 
 
-def _deskew_image(image: Image.Image) -> Image.Image:
-    # Lightweight deterministic deskew approximation using nearest 90° orientation.
-    return ImageOps.exif_transpose(image)
+def _check_timeout(*, started_at: float, timeout_seconds: float, processed_pages: int) -> None:
+    if timeout_seconds <= 0:
+        return
+    elapsed = time.monotonic() - started_at
+    if elapsed > timeout_seconds:
+        raise OCRLimitExceededError(
+            "OCR processing timed out before completion.",
+            code="OCR_TIMEOUT",
+            context={
+                "ocr_timeout_seconds": timeout_seconds,
+                "elapsed_seconds": round(elapsed, 3),
+                "processed_pages": processed_pages,
+            },
+        )
 
 
-def _binarize_image(image: Image.Image) -> Image.Image:
-    gray = image.convert("L")
-    return gray.point(lambda px: 255 if px > 128 else 0, mode="1")
-
-
-def _enhance_contrast(image: Image.Image) -> Image.Image:
-    return ImageEnhance.Contrast(image).enhance(1.5)
-
-
-def _apply_preprocessing(image: Image.Image, config: OCRConfig) -> tuple[Image.Image, list[str]]:
-    processed = image
-    applied_steps: list[str] = []
-
-    if config.preprocess_deskew:
-        processed = _deskew_image(processed)
-        applied_steps.append("deskew")
-
-    if config.preprocess_binarization:
-        processed = _binarize_image(processed)
-        applied_steps.append("binarization")
-
-    if config.preprocess_contrast_enhancement:
-        processed = _enhance_contrast(processed)
-        applied_steps.append("contrast_enhancement")
-
-    return processed, applied_steps
-
-
-def _ocr_image(image: Image.Image, config: OCRConfig) -> tuple[str, Dict[str, Any]]:
-    processed_image, applied_steps = _apply_preprocessing(image, config)
-    if config.language:
-        text = pytesseract.image_to_string(processed_image, lang=config.language)
-    else:
-        text = pytesseract.image_to_string(processed_image)
-
-    return text, {
-        "preprocessing_steps": applied_steps,
-        "language": config.language,
-    }
-
-
-def extract_text_from_image(image_path: str, config: OCRConfig | None = None) -> tuple[str, Dict[str, Any]]:
+def extract_text_from_image(image_path: str) -> str:
     """
     Extract text from an image file using Tesseract OCR.
     """
     _ensure_tesseract_available()
+    limits = _load_limits()
+    started_at = time.monotonic()
+
     image = Image.open(image_path)
-    effective_config = config or resolve_ocr_config()
-    text, diagnostics = _ocr_image(image, effective_config)
-    diagnostics.update({"source": "image", "page_count": 1})
-    return text, diagnostics
+    text = pytesseract.image_to_string(image)
+
+    _check_timeout(started_at=started_at, timeout_seconds=limits.timeout_seconds, processed_pages=1)
+    return text
 
 
 def extract_text_from_pdf(pdf_path: str, config: OCRConfig | None = None) -> tuple[str, Dict[str, Any]]:
@@ -156,31 +145,53 @@ def extract_text_from_pdf(pdf_path: str, config: OCRConfig | None = None) -> tup
     _ensure_tesseract_available()
     _ensure_pdf_runtime_available()
 
+    limits = _load_limits()
+    started_at = time.monotonic()
+
     convert_kwargs: Dict[str, str] = {}
     if SETTINGS.poppler_path:
         convert_kwargs["poppler_path"] = SETTINGS.poppler_path
 
-    pages = convert_from_path(pdf_path, **convert_kwargs)
-    effective_config = config or resolve_ocr_config()
+    page_info = pdfinfo_from_path(pdf_path, **convert_kwargs)
+    total_pages = int(page_info.get("Pages", 0))
+    if total_pages > limits.max_pages:
+        raise OCRLimitExceededError(
+            "Input PDF exceeds configured page limit for OCR.",
+            code="OCR_PAGE_LIMIT_EXCEEDED",
+            context={
+                "ocr_max_pages": limits.max_pages,
+                "detected_pages": total_pages,
+            },
+        )
 
-    page_texts: list[str] = []
-    applied_steps: list[str] = []
-    for idx, page in enumerate(pages):
-        text, page_diag = _ocr_image(page, effective_config)
-        page_texts.append(text)
-        if idx == 0:
-            applied_steps = page_diag["preprocessing_steps"]
+    text_parts: list[str] = []
+    for page_number in range(1, total_pages + 1):
+        _check_timeout(
+            started_at=started_at,
+            timeout_seconds=limits.timeout_seconds,
+            processed_pages=page_number - 1,
+        )
 
-    return "\n".join(page_texts), {
-        "source": "pdf",
-        "page_count": len(pages),
-        "preprocessing_steps": applied_steps,
-        "language": effective_config.language,
-    }
+        page_image = convert_from_path(
+            pdf_path,
+            first_page=page_number,
+            last_page=page_number,
+            **convert_kwargs,
+        )[0]
+        text_parts.append(pytesseract.image_to_string(page_image))
+
+    _check_timeout(
+        started_at=started_at,
+        timeout_seconds=limits.timeout_seconds,
+        processed_pages=total_pages,
+    )
+    return "\n".join(text_parts)
 
 
-def extract_text_with_diagnostics(file_path: str, tenant_id: str = "default") -> tuple[str, Dict[str, Any]]:
-    """Detect file type, run OCR, and return extracted text with OCR diagnostics."""
+def extract_text(file_path: str) -> str:
+    """
+    Detect file type and route to appropriate OCR method.
+    """
     ext = os.path.splitext(file_path)[1].lower()
     config = resolve_ocr_config(tenant_id=tenant_id)
 

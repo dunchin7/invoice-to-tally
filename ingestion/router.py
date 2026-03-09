@@ -3,15 +3,46 @@ import os
 from pathlib import Path
 from typing import Any
 
-from ocr.ocr_engine import extract_text, extract_text_with_diagnostics
+from ocr.ocr_engine import OCRLimitExceededError, extract_text
 
 
 class IngestionError(ValueError):
     """Raised when a file cannot be ingested using a supported strategy."""
 
+    def __init__(self, message: str, *, code: str = "INGESTION_ERROR", context: dict[str, object] | None = None):
+        super().__init__(message)
+        self.code = code
+        self.context = context or {}
+
 
 _SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff"}
 _SUPPORTED_WORD_EXTENSIONS = {".doc", ".docx"}
+
+
+def _format_ocr_limit_failure(exc: OCRLimitExceededError) -> IngestionError:
+    if exc.code == "OCR_PAGE_LIMIT_EXCEEDED":
+        return IngestionError(
+            "OCR page limit exceeded. "
+            f"Document has {exc.context.get('detected_pages')} pages while OCR_MAX_PAGES="
+            f"{exc.context.get('ocr_max_pages')}. "
+            "Split the document or increase OCR_MAX_PAGES and retry.",
+            code=exc.code,
+            context=exc.context,
+        )
+
+    if exc.code == "OCR_TIMEOUT":
+        processed = exc.context.get("processed_pages", 0)
+        timeout = exc.context.get("ocr_timeout_seconds")
+        return IngestionError(
+            "OCR processing timed out. "
+            f"Processed approximately {processed} pages before reaching the "
+            f"OCR_TIMEOUT_SECONDS limit ({timeout}s). "
+            "Retry with a higher timeout or a smaller file.",
+            code=exc.code,
+            context=exc.context,
+        )
+
+    return IngestionError(str(exc), code="OCR_LIMIT_EXCEEDED", context=exc.context)
 
 
 def _detect_file_type(file_path: str) -> tuple[str | None, str]:
@@ -90,11 +121,17 @@ def route_extraction_with_diagnostics(file_path: str, tenant_id: str = "default"
             return text_layer, {"source": "pdf_text_layer", "preprocessing_steps": [], "language": None}
 
         print("[i] Detected scanned PDF: no text layer found, running OCR pipeline.")
-        return extract_text_with_diagnostics(file_path, tenant_id=tenant_id)
+        try:
+            return extract_text(file_path)
+        except OCRLimitExceededError as exc:
+            raise _format_ocr_limit_failure(exc) from exc
 
     if ext in _SUPPORTED_IMAGE_EXTENSIONS or (mime_type and mime_type.startswith("image/")):
         print("[i] Detected image invoice: routing to OCR pipeline.")
-        return extract_text_with_diagnostics(file_path, tenant_id=tenant_id)
+        try:
+            return extract_text(file_path)
+        except OCRLimitExceededError as exc:
+            raise _format_ocr_limit_failure(exc) from exc
 
     if ext in _SUPPORTED_WORD_EXTENSIONS:
         print("[i] Detected Word document: extracting text with parser before LLM pipeline.")
