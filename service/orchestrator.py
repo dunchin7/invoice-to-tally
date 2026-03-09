@@ -88,6 +88,7 @@ class InvoiceOrchestrator:
             self._write_json(job_path / "job_record.json", record)
 
         try:
+            transition(InvoiceJobState.INGESTED, "operator:submitted_invoice", {"input_path": str(input_path)})
             raw_text = route_extraction(input_path)
             raw_text_path = job_path / "raw_ocr_text.txt"
             raw_text_path.write_text(raw_text, encoding="utf-8")
@@ -153,19 +154,19 @@ class InvoiceOrchestrator:
             extraction_confidence = extraction_result.get("confidence", {}).get("overall", 0.0)
 
             if preimport_report.blocking:
-                actionable = [
-                    {
-                        "field": issue.field,
-                        "entity_type": issue.entity_type,
-                        "extracted_value": issue.extracted_value,
-                        "message": issue.message,
-                        "suggestions": list(issue.suggestions),
-                        "suggestion_codes": list(issue.suggestion_codes),
-                    }
-                    for issue in preimport_report.issues
-                    if issue.action == "reject"
-                ]
-                raise ValueError(f"Pre-import reconciliation failed: {json.dumps(actionable)}")
+                queue_payload = {
+                    "job_id": job_id,
+                    "invoice_number": resolved_payload.get("invoice_number"),
+                    "confidence": extraction_confidence,
+                    "critical_failure": normalization.report.critical_failure,
+                    "reason": "validation_failed",
+                    "reconciliation_issues": [issue.__dict__ for issue in preimport_report.issues],
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                self._append_jsonl(self.review_queue_path, queue_payload)
+                record["review_queue_entry"] = queue_payload
+                transition(InvoiceJobState.REVIEW_REQUIRED, "system:routed_to_manual_review", queue_payload)
+                return record
 
             if (
                 extraction_confidence < self.low_confidence_threshold
