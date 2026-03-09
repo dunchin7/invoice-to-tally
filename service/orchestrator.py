@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -51,6 +54,7 @@ class InvoiceOrchestrator:
         self.base_path.mkdir(parents=True, exist_ok=True)
         self.low_confidence_threshold = low_confidence_threshold
         self.idempotency_store_path = self.base_path / "idempotency_store.json"
+        self.idempotency_lock_path = self.base_path / "idempotency_store.lock"
         self.review_queue_path = self.base_path / "manual_review_queue.jsonl"
 
     def process_invoice(
@@ -214,41 +218,42 @@ class InvoiceOrchestrator:
 
             idempotency_key = self._build_idempotency_key(resolved_payload)
             record["idempotency_key"] = idempotency_key
-            idempotency_store = self._read_json(self.idempotency_store_path, default={})
+            with self._file_lock(self.idempotency_lock_path):
+                idempotency_store = self._read_json(self.idempotency_store_path, default={})
 
-            if idempotency_key in idempotency_store:
-                response = {
-                    "status": "duplicate",
-                    "message": "Invoice already posted to Tally. Reusing prior response.",
-                    "posted_at": idempotency_store[idempotency_key].get("posted_at"),
-                    "response": idempotency_store[idempotency_key].get("response", {}),
+                if idempotency_key in idempotency_store:
+                    response = {
+                        "status": "duplicate",
+                        "message": "Invoice already posted to Tally. Reusing prior response.",
+                        "posted_at": idempotency_store[idempotency_key].get("posted_at"),
+                        "response": idempotency_store[idempotency_key].get("response", {}),
+                    }
+                    upload_response_path = job_path / "upload_response.json"
+                    self._write_json(upload_response_path, response)
+                    record["artifacts"]["upload_response"] = str(upload_response_path)
+                    transition(InvoiceJobState.POSTED, "system:duplicate_post_prevented", response)
+                    return record
+
+                xml_path = job_path / "tally_invoice.xml"
+                generate_tally_xml(resolved_payload, str(xml_path))
+                record["artifacts"]["generated_xml"] = str(xml_path)
+
+                upload_response = {
+                    "status": "success",
+                    "voucher_number": resolved_payload.get("invoice_number"),
+                    "posted_at": datetime.now(timezone.utc).isoformat(),
+                    "idempotency_key": idempotency_key,
                 }
                 upload_response_path = job_path / "upload_response.json"
-                self._write_json(upload_response_path, response)
+                self._write_json(upload_response_path, upload_response)
                 record["artifacts"]["upload_response"] = str(upload_response_path)
-                transition(InvoiceJobState.POSTED, "system:duplicate_post_prevented", response)
-                return record
 
-            xml_path = job_path / "tally_invoice.xml"
-            generate_tally_xml(resolved_payload, str(xml_path))
-            record["artifacts"]["generated_xml"] = str(xml_path)
-
-            upload_response = {
-                "status": "success",
-                "voucher_number": resolved_payload.get("invoice_number"),
-                "posted_at": datetime.now(timezone.utc).isoformat(),
-                "idempotency_key": idempotency_key,
-            }
-            upload_response_path = job_path / "upload_response.json"
-            self._write_json(upload_response_path, upload_response)
-            record["artifacts"]["upload_response"] = str(upload_response_path)
-
-            idempotency_store[idempotency_key] = {
-                "job_id": job_id,
-                "posted_at": upload_response["posted_at"],
-                "response": upload_response,
-            }
-            self._write_json(self.idempotency_store_path, idempotency_store)
+                idempotency_store[idempotency_key] = {
+                    "job_id": job_id,
+                    "posted_at": upload_response["posted_at"],
+                    "response": upload_response,
+                }
+                self._write_json_atomic(self.idempotency_store_path, idempotency_store)
 
             transition(InvoiceJobState.POSTED, "system:posted_to_tally", upload_response)
             return record
@@ -310,6 +315,16 @@ class InvoiceOrchestrator:
             json.dump(payload, handle, indent=2)
 
     @staticmethod
+    def _write_json_atomic(path: Path, payload: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", dir=path.parent, encoding="utf-8", delete=False) as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
+
+    @staticmethod
     def _read_json(path: Path, default: Any) -> Any:
         if not path.exists():
             return default
@@ -321,3 +336,19 @@ class InvoiceOrchestrator:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload) + "\n")
+
+    @staticmethod
+    @contextmanager
+    def _file_lock(path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a+", encoding="utf-8") as handle:
+            try:
+                import fcntl
+            except ImportError as exc:  # pragma: no cover
+                raise RuntimeError("File locking is unsupported on this platform") from exc
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

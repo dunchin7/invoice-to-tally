@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 from service.orchestrator import InvoiceJobState, InvoiceOrchestrator
 from validation.errors import AccountingValidationError, FieldNormalizationError
@@ -148,6 +149,8 @@ def test_reconciliation_payload_includes_rule_learning_summary(tmp_path, monkeyp
     assert learning["enabled"] is True
     assert learning["learned"] is True
     assert learning["stored_in"] == ["sqlite"]
+
+
 def test_schema_or_normalization_error_sets_structured_failure(tmp_path, monkeypatch):
     _patch_pipeline(monkeypatch, blocking=False)
     monkeypatch.setattr(
@@ -186,3 +189,42 @@ def test_accounting_error_routes_review_with_structured_context(tmp_path, monkey
     assert result["state"] == InvoiceJobState.REVIEW_REQUIRED.value
     assert result["error_code"] == "ACCOUNTING_VALIDATION_ERROR"
     assert result["review_queue_entry"]["error_code"] == "ACCOUNTING_VALIDATION_ERROR"
+
+
+def test_idempotency_is_atomic_under_concurrency(tmp_path, monkeypatch):
+    _patch_pipeline(monkeypatch, blocking=False)
+
+    orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
+    gate = threading.Barrier(2)
+    generated = []
+
+    original_builder = orchestrator._build_idempotency_key
+
+    def _waited_builder(invoice):
+        gate.wait(timeout=2)
+        return original_builder(invoice)
+
+    monkeypatch.setattr(orchestrator, "_build_idempotency_key", _waited_builder)
+    monkeypatch.setattr("service.orchestrator.generate_tally_xml", lambda _invoice, path: generated.append(path))
+
+    results = []
+
+    def _run():
+        results.append(orchestrator.process_invoice(input_path="invoice.pdf", master_data_file="master.json"))
+
+    first = threading.Thread(target=_run)
+    second = threading.Thread(target=_run)
+    first.start()
+    second.start()
+    first.join()
+    second.join()
+
+    assert len(results) == 2
+    assert len(generated) == 1
+
+    response_statuses = []
+    for result in results:
+        with open(result["artifacts"]["upload_response"], "r", encoding="utf-8") as handle:
+            response_statuses.append(json.load(handle)["status"])
+
+    assert sorted(response_statuses) == ["duplicate", "success"]

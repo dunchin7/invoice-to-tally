@@ -243,6 +243,8 @@ It also writes:
 - `outputs/orchestration/manual_review_queue.jsonl` for low-confidence or validation-failed invoices.
 - `outputs/orchestration/idempotency_store.json` to prevent duplicate Tally posting for the same invoice.
 
+Idempotency persistence is guarded by a file lock (`idempotency_store.lock`) so duplicate submissions for the same idempotency key are resolved atomically. The first winner records the successful upload response, and later duplicates are marked as `duplicate` with the original response nested under `response` for replay retrieval and traceability.
+
 ## 🔑 Gemini API Key Setup
 
 1. Go to: [https://makersuite.google.com/app/apikey](https://makersuite.google.com/app/apikey)
