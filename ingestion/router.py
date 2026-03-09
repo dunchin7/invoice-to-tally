@@ -1,6 +1,7 @@
 import mimetypes
 import os
 from pathlib import Path
+from typing import Any
 
 from ocr.ocr_engine import OCRLimitExceededError, extract_text
 
@@ -103,7 +104,7 @@ def _extract_doc_text(file_path: str) -> str:
     return text
 
 
-def route_extraction(file_path: str) -> str:
+def route_extraction_with_diagnostics(file_path: str, tenant_id: str = "default") -> tuple[str, dict[str, Any]]:
     if not os.path.exists(file_path):
         raise IngestionError(
             f"Input file not found: {file_path}. "
@@ -117,7 +118,7 @@ def route_extraction(file_path: str) -> str:
 
         if text_layer.strip():
             print("[i] Detected digital PDF: using embedded text layer extraction.")
-            return text_layer
+            return text_layer, {"source": "pdf_text_layer", "preprocessing_steps": [], "language": None}
 
         print("[i] Detected scanned PDF: no text layer found, running OCR pipeline.")
         try:
@@ -146,7 +147,7 @@ def route_extraction(file_path: str) -> str:
                 "Open the file and ensure it contains selectable text, then try again."
             )
 
-        return extracted
+        return extracted, {"source": "word_parser", "preprocessing_steps": [], "language": None}
 
     hint = (
         "Supported formats are PDF, PNG, JPG, JPEG, TIFF, DOC, and DOCX. "
@@ -154,3 +155,8 @@ def route_extraction(file_path: str) -> str:
     )
     readable_type = mime_type or ext or "unknown"
     raise IngestionError(f"Unsupported input format: {readable_type}. {hint}")
+
+
+def route_extraction(file_path: str, tenant_id: str = "default") -> str:
+    text, _ = route_extraction_with_diagnostics(file_path, tenant_id=tenant_id)
+    return text

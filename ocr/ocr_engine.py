@@ -137,7 +137,7 @@ def extract_text_from_image(image_path: str) -> str:
     return text
 
 
-def extract_text_from_pdf(pdf_path: str) -> str:
+def extract_text_from_pdf(pdf_path: str, config: OCRConfig | None = None) -> tuple[str, Dict[str, Any]]:
     """
     Convert PDF pages to images and extract text from each page.
     Uses optional Poppler path when configured.
@@ -193,11 +193,20 @@ def extract_text(file_path: str) -> str:
     Detect file type and route to appropriate OCR method.
     """
     ext = os.path.splitext(file_path)[1].lower()
+    config = resolve_ocr_config(tenant_id=tenant_id)
 
     if ext in [".png", ".jpg", ".jpeg", ".tiff"]:
-        return extract_text_from_image(file_path)
+        return extract_text_from_image(file_path, config=config)
 
     if ext == ".pdf":
-        return extract_text_from_pdf(file_path)
+        return extract_text_from_pdf(file_path, config=config)
 
     raise ValueError(f"Unsupported file type: {ext}")
+
+
+def extract_text(file_path: str, tenant_id: str = "default") -> str:
+    """
+    Detect file type and route to appropriate OCR method.
+    """
+    text, _ = extract_text_with_diagnostics(file_path, tenant_id=tenant_id)
+    return text
