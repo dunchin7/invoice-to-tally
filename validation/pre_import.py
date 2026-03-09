@@ -4,6 +4,7 @@ import json
 import re
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -41,6 +42,7 @@ class ResolutionReport:
     invoice: dict
     resolutions: tuple[EntityResolution, ...]
     issues: tuple[MappingIssue, ...]
+    learned_rules: tuple[dict, ...] = ()
 
     @property
     def blocking(self) -> bool:
@@ -65,9 +67,20 @@ class MappingRuleStore:
         tenant_section = payload.get("tenants", {}).get(tenant_id, {})
         for scope in (tenant_section, payload.get("global", {})):
             mapped = scope.get(entity_type, {}).get(key)
-            if mapped:
-                return str(mapped).strip()
+            mapped_value = self._mapping_value(mapped)
+            if mapped_value:
+                return mapped_value
         return None
+
+    def should_learn_rule_on_approval(self, tenant_id: str) -> bool:
+        payload = self._load_json()
+        tenant_setting = payload.get("settings", {}).get("tenants", {}).get(tenant_id, {}).get("learn_rule_on_approval")
+        if tenant_setting is not None:
+            return bool(tenant_setting)
+        global_setting = payload.get("settings", {}).get("global", {}).get("learn_rule_on_approval")
+        if global_setting is not None:
+            return bool(global_setting)
+        return False
 
     def upsert(self, tenant_id: str, entity_type: MasterType, extracted_value: str, tally_name_or_code: str) -> None:
         """Persist a tenant-specific rule in SQLite when configured."""
@@ -99,6 +112,48 @@ class MappingRuleStore:
             )
             conn.commit()
 
+    def learn_rule_on_approval(
+        self,
+        tenant_id: str,
+        entity_type: MasterType,
+        extracted_value: str,
+        tally_name_or_code: str,
+        provenance: dict,
+    ) -> dict:
+        normalized_value = _key(extracted_value)
+        mapped_value = tally_name_or_code.strip()
+        existing = self.lookup(tenant_id, entity_type, extracted_value)
+        if existing and _key(existing) == _key(mapped_value):
+            return {
+                "entity_type": entity_type,
+                "extracted_value": extracted_value,
+                "mapped_value": mapped_value,
+                "learned": False,
+                "duplicate": True,
+                "stored_in": "none",
+            }
+
+        if self.sqlite_path:
+            self._upsert_sqlite_with_provenance(tenant_id, entity_type, normalized_value, mapped_value, provenance)
+            return {
+                "entity_type": entity_type,
+                "extracted_value": extracted_value,
+                "mapped_value": mapped_value,
+                "learned": True,
+                "duplicate": False,
+                "stored_in": "sqlite",
+            }
+
+        self._upsert_json_with_provenance(tenant_id, entity_type, normalized_value, mapped_value, provenance)
+        return {
+            "entity_type": entity_type,
+            "extracted_value": extracted_value,
+            "mapped_value": mapped_value,
+            "learned": True,
+            "duplicate": False,
+            "stored_in": "json",
+        }
+
     def _load_json(self) -> dict:
         if not self.json_path.exists():
             return {"global": {}, "tenants": {}}
@@ -127,6 +182,89 @@ class MappingRuleStore:
             return str(row[0]).strip()
         return None
 
+    @staticmethod
+    def _mapping_value(raw_mapping: object) -> str | None:
+        if isinstance(raw_mapping, dict):
+            value = raw_mapping.get("value")
+            if value:
+                return str(value).strip()
+            return None
+        if raw_mapping:
+            return str(raw_mapping).strip()
+        return None
+
+    def _upsert_sqlite_with_provenance(
+        self,
+        tenant_id: str,
+        entity_type: MasterType,
+        normalized_value: str,
+        mapped_value: str,
+        provenance: dict,
+    ) -> None:
+        db_file = Path(self.sqlite_path or "")
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(db_file) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS mapping_rules (
+                    tenant_id TEXT NOT NULL,
+                    entity_type TEXT NOT NULL,
+                    normalized_value TEXT NOT NULL,
+                    tally_name TEXT NOT NULL,
+                    provenance_json TEXT,
+                    learned_at TEXT,
+                    PRIMARY KEY (tenant_id, entity_type, normalized_value)
+                )
+                """
+            )
+            table_info = conn.execute("PRAGMA table_info(mapping_rules)").fetchall()
+            columns = {row[1] for row in table_info}
+            if "provenance_json" not in columns:
+                conn.execute("ALTER TABLE mapping_rules ADD COLUMN provenance_json TEXT")
+            if "learned_at" not in columns:
+                conn.execute("ALTER TABLE mapping_rules ADD COLUMN learned_at TEXT")
+
+            conn.execute(
+                """
+                INSERT INTO mapping_rules (tenant_id, entity_type, normalized_value, tally_name, provenance_json, learned_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id, entity_type, normalized_value)
+                DO UPDATE SET
+                    tally_name = excluded.tally_name,
+                    provenance_json = excluded.provenance_json,
+                    learned_at = excluded.learned_at
+                """,
+                (
+                    tenant_id,
+                    entity_type,
+                    normalized_value,
+                    mapped_value,
+                    json.dumps(provenance),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def _upsert_json_with_provenance(
+        self,
+        tenant_id: str,
+        entity_type: MasterType,
+        normalized_value: str,
+        mapped_value: str,
+        provenance: dict,
+    ) -> None:
+        payload = self._load_json()
+        tenants = payload.setdefault("tenants", {})
+        tenant_rules = tenants.setdefault(tenant_id, {})
+        entity_rules = tenant_rules.setdefault(entity_type, {})
+        entity_rules[normalized_value] = {
+            "value": mapped_value,
+            "provenance": provenance,
+            "learned_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.json_path.parent.mkdir(parents=True, exist_ok=True)
+        self.json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
 
 class PreImportResolver:
     def __init__(
@@ -145,7 +283,7 @@ class PreImportResolver:
         if fallback_policy:
             self.fallback_policy.update(fallback_policy)
 
-    def resolve_invoice(self, invoice: dict, tenant_id: str) -> ResolutionReport:
+    def resolve_invoice(self, invoice: dict, tenant_id: str, approved: bool = False, approved_by: str = "system") -> ResolutionReport:
         working = dict(invoice)
         resolutions: list[EntityResolution] = []
         issues: list[MappingIssue] = []
@@ -199,7 +337,31 @@ class PreImportResolver:
                 issues.append(stock_issue)
 
         working["line_items"] = resolved_items
-        return ResolutionReport(invoice=working, resolutions=tuple(resolutions), issues=tuple(issues))
+        learned_rules: list[dict] = []
+        if approved and self.rule_store.should_learn_rule_on_approval(tenant_id):
+            for resolution in resolutions:
+                if resolution.source != "created" or not resolution.resolved_name:
+                    continue
+                learned_rules.append(
+                    self.rule_store.learn_rule_on_approval(
+                        tenant_id=tenant_id,
+                        entity_type=resolution.entity_type,
+                        extracted_value=resolution.extracted_value,
+                        tally_name_or_code=resolution.resolved_name,
+                        provenance={
+                            "source": "approval",
+                            "approved_by": approved_by,
+                            "tenant_id": tenant_id,
+                        },
+                    )
+                )
+
+        return ResolutionReport(
+            invoice=working,
+            resolutions=tuple(resolutions),
+            issues=tuple(issues),
+            learned_rules=tuple(learned_rules),
+        )
 
     def _resolve_entity(
         self,

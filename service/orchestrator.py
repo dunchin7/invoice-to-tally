@@ -58,6 +58,7 @@ class InvoiceOrchestrator:
         mapping_rules_file: str = "validation/config/mapping_rules.json",
         mapping_rules_db: str = "",
         fallback_policy: dict[str, str] | None = None,
+        reconciliation_approved: bool = False,
     ) -> Dict[str, Any]:
         job_id = str(uuid4())
         job_path = self.base_path / job_id
@@ -124,17 +125,29 @@ class InvoiceOrchestrator:
                 rule_store=MappingRuleStore(json_path=mapping_rules_file, sqlite_path=mapping_rules_db or None),
                 fallback_policy=fallback_policy,
             )
-            preimport_report = resolver.resolve_invoice(normalized_payload, tenant_id=tenant_id)
+            preimport_report = resolver.resolve_invoice(
+                normalized_payload,
+                tenant_id=tenant_id,
+                approved=reconciliation_approved,
+                approved_by=operator,
+            )
             resolved_payload = preimport_report.invoice
 
             normalized_json_path = job_path / "normalized_invoice.json"
             self._write_json(normalized_json_path, resolved_payload)
             record["artifacts"]["normalized_json"] = str(normalized_json_path)
 
+            learned_rules = [dict(item) for item in preimport_report.learned_rules]
             reconciliation_payload = {
                 "blocking": preimport_report.blocking,
                 "resolutions": [resolution.__dict__ for resolution in preimport_report.resolutions],
                 "issues": [issue.__dict__ for issue in preimport_report.issues],
+                "rule_learning": {
+                    "enabled": bool(reconciliation_approved),
+                    "learned": any(item.get("learned") for item in learned_rules),
+                    "entries": learned_rules,
+                    "stored_in": sorted({item.get("stored_in") for item in learned_rules if item.get("stored_in") and item.get("stored_in") != "none"}),
+                },
             }
 
             validation_report_path = job_path / "validation_report.json"

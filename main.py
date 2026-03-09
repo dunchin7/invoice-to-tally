@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--party-fallback", choices=["auto_create", "reject", "manual_review"], default="manual_review")
     parser.add_argument("--ledger-fallback", choices=["auto_create", "reject", "manual_review"], default="reject")
     parser.add_argument("--stock-fallback", choices=["auto_create", "reject", "manual_review"], default="manual_review")
+    parser.add_argument("--reconciliation-approved", action="store_true")
     return parser.parse_args()
 
 
@@ -45,6 +46,7 @@ def main() -> None:
             "ledger": args.ledger_fallback,
             "stock_item": args.stock_fallback,
         },
+        reconciliation_approved=args.reconciliation_approved,
     )
 
     print(json.dumps(result, indent=2))

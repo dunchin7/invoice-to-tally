@@ -24,11 +24,12 @@ class _MasterData:
 
 
 class _PreImportReport:
-    def __init__(self, invoice, blocking=False, issues=None):
+    def __init__(self, invoice, blocking=False, issues=None, learned_rules=None):
         self.invoice = invoice
         self.blocking = blocking
         self.resolutions = []
         self.issues = issues or []
+        self.learned_rules = learned_rules or []
 
 
 class _Issue:
@@ -111,3 +112,38 @@ def test_idempotency_prevents_duplicate_posting(tmp_path, monkeypatch):
         response = json.load(handle)
 
     assert response["status"] == "duplicate"
+
+
+
+def test_reconciliation_payload_includes_rule_learning_summary(tmp_path, monkeypatch):
+    _patch_pipeline(monkeypatch, blocking=False)
+
+    learned = [{"learned": True, "stored_in": "sqlite", "entity_type": "ledger"}]
+    normalized = {
+        "invoice_number": "INV-1",
+        "invoice_date": "2024-01-01",
+        "total": 100,
+        "seller": "SELLER",
+        "buyer": "BUYER",
+        "line_items": [],
+    }
+    monkeypatch.setattr(
+        "service.orchestrator.PreImportResolver",
+        lambda **_kwargs: _Resolver(_PreImportReport(normalized, blocking=False, issues=[], learned_rules=learned)),
+    )
+
+    orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
+    result = orchestrator.process_invoice(
+        input_path="invoice.pdf",
+        master_data_file="master.json",
+        reconciliation_approved=True,
+    )
+
+    validation_path = result["artifacts"]["validation_report"]
+    with open(validation_path, "r", encoding="utf-8") as handle:
+        report = json.load(handle)
+
+    learning = report["reconciliation"]["rule_learning"]
+    assert learning["enabled"] is True
+    assert learning["learned"] is True
+    assert learning["stored_in"] == ["sqlite"]
