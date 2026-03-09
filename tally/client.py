@@ -13,6 +13,8 @@ class TallyClientConfig:
     host: str = "localhost"
     port: int = 9000
     company: str | None = None
+    voucher_type: str = "Sales"
+    voucher_action: str = "Create"
     timeout_seconds: float = 15.0
     max_retries: int = 3
     retry_backoff_seconds: float = 1.0
@@ -75,10 +77,11 @@ def parse_tally_response(xml_body: str, endpoint: str) -> TallyUploadStatus:
             line_errors.append(line_error.text.strip())
 
     ok = errors == 0 and len(line_errors) == 0
-    if ok:
-        message = f"Imported successfully (created={created}, altered={altered}, ignored={ignored})."
-    else:
-        message = "Import failed. " + "; ".join(line_errors) if line_errors else "Import failed with Tally errors."
+    message = (
+        f"Imported successfully (created={created}, altered={altered}, ignored={ignored})."
+        if ok
+        else ("Import failed. " + "; ".join(line_errors) if line_errors else "Import failed with Tally errors.")
+    )
 
     return TallyUploadStatus(
         ok=ok,
@@ -115,14 +118,11 @@ class TallyClient:
                 )
                 response.raise_for_status()
                 return parse_tally_response(response.text, endpoint=endpoint)
-            except Exception as exc:  # requests raises varied exception types
+            except Exception as exc:
                 last_error = exc
-                is_last_attempt = attempt >= self._config.max_retries
-                if is_last_attempt or not _is_transient(exc):
+                if attempt >= self._config.max_retries or not _is_transient(exc):
                     break
-
-                backoff = self._config.retry_backoff_seconds * (2**attempt)
-                time.sleep(backoff)
+                time.sleep(self._config.retry_backoff_seconds * (2**attempt))
 
         return TallyUploadStatus(
             ok=False,

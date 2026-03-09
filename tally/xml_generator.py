@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Callable
-from xml.etree.ElementTree import Element, ElementTree, SubElement
+from xml.etree.ElementTree import Element, ElementTree, SubElement, tostring
 
 TWOPLACES = Decimal("0.01")
 DEFAULT_LEDGER_NAMES = {
@@ -29,7 +29,7 @@ DEFAULT_VOUCHER_TYPES = {
 class VoucherLedgerEntry:
     ledger_name: str
     amount: Decimal
-    entry_type: str  # "debit" or "credit"
+    entry_type: str
 
 
 @dataclass(frozen=True)
@@ -107,6 +107,8 @@ def _build_ledger_resolver(config: dict[str, Any]) -> LedgerResolver:
 
 
 def _collect_amounts(invoice: dict[str, Any]) -> dict[str, Decimal]:
+    line_items = invoice.get("line_items", [])
+
     taxable = Decimal("0")
     cgst = Decimal("0")
     sgst = Decimal("0")
@@ -144,11 +146,8 @@ def _collect_amounts(invoice: dict[str, Any]) -> dict[str, Decimal]:
 
 
 def _validate_balancing(entries: list[VoucherLedgerEntry]) -> None:
-    debit = sum((entry.amount for entry in entries if entry.entry_type == "debit"), Decimal("0"))
-    credit = sum((entry.amount for entry in entries if entry.entry_type == "credit"), Decimal("0"))
-
-    debit = _quantize(debit)
-    credit = _quantize(credit)
+    debit = _quantize(sum((entry.amount for entry in entries if entry.entry_type == "debit"), Decimal("0")))
+    credit = _quantize(sum((entry.amount for entry in entries if entry.entry_type == "credit"), Decimal("0")))
 
     if debit != credit:
         raise VoucherBalanceError(f"Unbalanced voucher entries: debit={debit} credit={credit}")
@@ -173,30 +172,16 @@ def map_invoice_to_voucher(invoice: dict[str, Any], config: dict[str, Any] | Non
     for tax_role in ("cgst", "sgst", "igst"):
         amount = amounts[tax_role]
         if amount > 0:
-            entries.append(
-                VoucherLedgerEntry(
-                    ledger_name=ledger_resolver(tax_role, invoice),
-                    amount=amount,
-                    entry_type="credit",
-                )
-            )
+            entries.append(VoucherLedgerEntry(ledger_name=ledger_resolver(tax_role, invoice), amount=amount, entry_type="credit"))
 
     max_round_off = _to_decimal(config.get("max_round_off", "1.00"))
     if abs(amounts["round_off"]) > max_round_off:
-        raise VoucherBalanceError(
-            f"Round-off {amounts['round_off']} exceeds configured threshold {max_round_off}"
-        )
+        raise VoucherBalanceError(f"Round-off {amounts['round_off']} exceeds configured threshold {max_round_off}")
 
     if amounts["round_off"] != 0:
         round_off_amount = abs(amounts["round_off"])
         round_off_type = "credit" if amounts["round_off"] > 0 else "debit"
-        entries.append(
-            VoucherLedgerEntry(
-                ledger_name=ledger_resolver("round_off", invoice),
-                amount=round_off_amount,
-                entry_type=round_off_type,
-            )
-        )
+        entries.append(VoucherLedgerEntry(ledger_name=ledger_resolver("round_off", invoice), amount=round_off_amount, entry_type=round_off_type))
 
     _validate_balancing(entries)
 
@@ -210,15 +195,8 @@ def map_invoice_to_voucher(invoice: dict[str, Any], config: dict[str, Any] | Non
     )
 
 
-def serialize_voucher_mapping(
-    voucher_mapping: VoucherMapping,
-    output_path: str,
-    *,
-    company: str | None = None,
-    voucher_action: str = "Create",
-) -> None:
+def _build_xml_tree(voucher_mapping: VoucherMapping, *, company: str | None = None, voucher_action: str = "Create") -> Element:
     envelope = Element("ENVELOPE")
-
     header = SubElement(envelope, "HEADER")
     SubElement(header, "TALLYREQUEST").text = "Import Data"
 
@@ -234,13 +212,7 @@ def serialize_voucher_mapping(
 
     requestdata = SubElement(importdata, "REQUESTDATA")
     tallymessage = SubElement(requestdata, "TALLYMESSAGE")
-
-    voucher = SubElement(
-        tallymessage,
-        "VOUCHER",
-        VCHTYPE=voucher_mapping.voucher_type,
-        ACTION=voucher_action,
-    )
+    voucher = SubElement(tallymessage, "VOUCHER", VCHTYPE=voucher_mapping.voucher_type, ACTION=voucher_action)
 
     SubElement(voucher, "DATE").text = voucher_mapping.date
     SubElement(voucher, "VOUCHERNUMBER").text = voucher_mapping.voucher_number
@@ -250,27 +222,37 @@ def serialize_voucher_mapping(
     for entry in voucher_mapping.entries:
         ledger_entry = SubElement(voucher, "ALLLEDGERENTRIES.LIST")
         SubElement(ledger_entry, "LEDGERNAME").text = entry.ledger_name
-        is_deemed_positive = "Yes" if entry.entry_type == "debit" else "No"
-        SubElement(ledger_entry, "ISDEEMEDPOSITIVE").text = is_deemed_positive
-        amount_text = str(entry.amount if entry.entry_type == "credit" else -entry.amount)
-        SubElement(ledger_entry, "AMOUNT").text = amount_text
+        SubElement(ledger_entry, "ISDEEMEDPOSITIVE").text = "Yes" if entry.entry_type == "debit" else "No"
+        SubElement(ledger_entry, "AMOUNT").text = str(entry.amount)
 
-    tree = ElementTree(envelope)
-    tree.write(output_path, encoding="utf-8", xml_declaration=True)
+    return envelope
+
+
+def build_tally_xml(
+    invoice: dict[str, Any],
+    *,
+    company: str | None = None,
+    voucher_type: str | None = None,
+    voucher_action: str = "Create",
+) -> str:
+    voucher_mapping = map_invoice_to_voucher(invoice, config={"voucher_type": voucher_type})
+    root = _build_xml_tree(voucher_mapping, company=company, voucher_action=voucher_action)
+    return tostring(root, encoding="utf-8", xml_declaration=True).decode("utf-8")
 
 
 def generate_tally_xml(
     invoice: dict[str, Any],
     output_path: str,
     *,
-    config: dict[str, Any] | None = None,
     company: str | None = None,
+    voucher_type: str | None = None,
     voucher_action: str = "Create",
+    config: dict[str, Any] | None = None,
 ) -> None:
-    mapping = map_invoice_to_voucher(invoice, config=config)
-    serialize_voucher_mapping(
-        mapping,
-        output_path,
-        company=company,
-        voucher_action=voucher_action,
-    )
+    config = config or {}
+    if voucher_type is not None:
+        config = {**config, "voucher_type": voucher_type}
+    voucher_mapping = map_invoice_to_voucher(invoice, config=config)
+    root = _build_xml_tree(voucher_mapping, company=company, voucher_action=voucher_action)
+    tree = ElementTree(root)
+    tree.write(output_path, encoding="utf-8", xml_declaration=True)
