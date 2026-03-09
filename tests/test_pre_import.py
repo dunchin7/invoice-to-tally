@@ -2,7 +2,7 @@ import json
 import sqlite3
 
 from tally.master_data import TallyMasterData, TallyMasterDataClient, TallyMasterRecord
-from validation.pre_import import MappingRuleStore, PreImportResolver
+from validation.pre_import import MappingRuleStore, PreImportResolver, _top_suggestions
 
 
 def _master_data() -> TallyMasterData:
@@ -217,3 +217,45 @@ def test_preimport_learning_is_idempotent_for_duplicate_approvals(tmp_path):
     assert first.learned_rules[0]["learned"] is True
     assert second.learned_rules[0]["learned"] is False
     assert second.learned_rules[0]["duplicate"] is True
+def test_top_suggestions_improves_ocr_noisy_vendor_ranking():
+    records = (
+        TallyMasterRecord(name="GLOBAL SOLUTIONS LLP", code="L001", aliases=("Global Sol",)),
+        TallyMasterRecord(name="GLOBAL SOURCING LLP", code="L999", aliases=()),
+        TallyMasterRecord(name="GREEN SUPPLIES", code="L123", aliases=()),
+    )
+
+    ranked = _top_suggestions("GL0BAL S0LUT10NS LLP", records, limit=2)
+
+    assert ranked[0].record.name == "GLOBAL SOLUTIONS LLP"
+    assert ranked[0].breakdown["edit_ratio"] > ranked[1].breakdown["edit_ratio"]
+    assert ranked[0].breakdown["ocr_boost"] > 0
+
+
+def test_preimport_issue_contains_ranked_suggestion_breakdown(tmp_path):
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text(
+        json.dumps({"global": {"party": {}, "ledger": {}, "stock_item": {}}, "tenants": {}}),
+        encoding="utf-8",
+    )
+
+    master = TallyMasterData(
+        parties=(TallyMasterRecord(name="ACME INDUSTRIES", code="P101", aliases=("ACME Ind",)),),
+        ledgers=(
+            TallyMasterRecord(name="ORBITAL VENDORS", code="L100", aliases=("Orbital",)),
+            TallyMasterRecord(name="ORANGE TRADERS", code="L200", aliases=()),
+        ),
+        stock_items=(),
+        fetched_at_epoch=1.0,
+        source="test",
+    )
+    resolver = PreImportResolver(master, MappingRuleStore(json_path=str(rules_path)))
+    report = resolver.resolve_invoice(
+        {"buyer": "ACME INDUSTRIES", "seller": "0RBITAL VEND0R5", "line_items": []}, tenant_id="default"
+    )
+
+    ledger_issue = [issue for issue in report.issues if issue.entity_type == "ledger"][0]
+    assert ledger_issue.suggestions[0] == "ORBITAL VENDORS"
+    assert ledger_issue.suggestion_score_breakdown
+    assert ledger_issue.suggestion_score_breakdown[0]["weighted_score"] >= ledger_issue.suggestion_score_breakdown[1][
+        "weighted_score"
+    ]

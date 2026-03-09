@@ -1,3 +1,9 @@
+from validation.errors import (
+    AccountingValidationError,
+    FieldNormalizationError,
+    SchemaValidationError,
+    ValidationFlowError,
+)
 from validation.normalizer import validate_invoice
 from validation.pipeline import (
     NormalizationResult,
@@ -22,4 +28,8 @@ __all__ = [
     "MappingRuleStore",
     "PreImportResolver",
     "ResolutionReport",
+    "ValidationFlowError",
+    "SchemaValidationError",
+    "AccountingValidationError",
+    "FieldNormalizationError",
 ]

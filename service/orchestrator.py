@@ -13,6 +13,12 @@ from ingestion.router import IngestionError, route_extraction
 from llm.extractor import extract_structured_invoice
 from tally.master_data import TallyMasterDataClient, load_master_data_from_file
 from tally.xml_generator import generate_tally_xml
+from validation.errors import (
+    AccountingValidationError,
+    FieldNormalizationError,
+    SchemaValidationError,
+    ValidationFlowError,
+)
 from validation.pipeline import run_normalization_pipeline, to_mutable_invoice
 from validation.pre_import import MappingRuleStore, PreImportResolver
 
@@ -247,6 +253,38 @@ class InvoiceOrchestrator:
             transition(InvoiceJobState.POSTED, "system:posted_to_tally", upload_response)
             return record
 
+        except (SchemaValidationError, FieldNormalizationError) as exc:
+            details = {"error": str(exc), "error_code": exc.code, "error_context": exc.context}
+            transition(InvoiceJobState.FAILED, "system:validation_schema_failed", details)
+            record["error"] = str(exc)
+            record["error_code"] = exc.code
+            record["error_context"] = exc.context
+            return record
+        except AccountingValidationError as exc:
+            queue_payload = {
+                "job_id": job_id,
+                "invoice_number": None,
+                "confidence": None,
+                "critical_failure": True,
+                "reason": "validation_failed",
+                "error_code": exc.code,
+                "error_context": exc.context,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            self._append_jsonl(self.review_queue_path, queue_payload)
+            record["review_queue_entry"] = queue_payload
+            transition(InvoiceJobState.REVIEW_REQUIRED, "system:accounting_validation_failed", queue_payload)
+            record["error"] = str(exc)
+            record["error_code"] = exc.code
+            record["error_context"] = exc.context
+            return record
+        except ValidationFlowError as exc:
+            details = {"error": str(exc), "error_code": exc.code, "error_context": exc.context}
+            transition(InvoiceJobState.FAILED, "system:validation_failed", details)
+            record["error"] = str(exc)
+            record["error_code"] = exc.code
+            record["error_context"] = exc.context
+            return record
         except (IngestionError, RuntimeError, ValueError) as exc:
             transition(InvoiceJobState.FAILED, "system:processing_failed", {"error": str(exc)})
             record["error"] = str(exc)

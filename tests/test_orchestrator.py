@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from service.orchestrator import InvoiceJobState, InvoiceOrchestrator
+from validation.errors import AccountingValidationError, FieldNormalizationError
 
 
 class _Normalization:
@@ -147,3 +148,41 @@ def test_reconciliation_payload_includes_rule_learning_summary(tmp_path, monkeyp
     assert learning["enabled"] is True
     assert learning["learned"] is True
     assert learning["stored_in"] == ["sqlite"]
+def test_schema_or_normalization_error_sets_structured_failure(tmp_path, monkeypatch):
+    _patch_pipeline(monkeypatch, blocking=False)
+    monkeypatch.setattr(
+        "service.orchestrator.run_normalization_pipeline",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            FieldNormalizationError(
+                "bad payload",
+                context={"field": "invoice", "expected": "object", "actual": "list"},
+            )
+        ),
+    )
+
+    orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
+    result = orchestrator.process_invoice(input_path="invoice.pdf", master_data_file="master.json")
+
+    assert result["state"] == InvoiceJobState.FAILED.value
+    assert result["error_code"] == "FIELD_NORMALIZATION_ERROR"
+    assert result["error_context"]["field"] == "invoice"
+
+
+def test_accounting_error_routes_review_with_structured_context(tmp_path, monkeypatch):
+    _patch_pipeline(monkeypatch, blocking=False)
+    monkeypatch.setattr(
+        "service.orchestrator.run_normalization_pipeline",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AccountingValidationError(
+                "totals mismatch",
+                context={"field": "totals", "expected": "subtotal + tax == total", "actual": ["delta=10"]},
+            )
+        ),
+    )
+
+    orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path))
+    result = orchestrator.process_invoice(input_path="invoice.pdf", master_data_file="master.json")
+
+    assert result["state"] == InvoiceJobState.REVIEW_REQUIRED.value
+    assert result["error_code"] == "ACCOUNTING_VALIDATION_ERROR"
+    assert result["review_queue_entry"]["error_code"] == "ACCOUNTING_VALIDATION_ERROR"

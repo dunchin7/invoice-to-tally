@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ class MappingIssue:
     message: str
     suggestions: tuple[str, ...] = ()
     suggestion_codes: tuple[str, ...] = ()
+    suggestion_score_breakdown: tuple[dict[str, float | str], ...] = ()
     remediation: tuple[str, ...] = ()
     action: Literal["auto_create", "reject", "manual_review"] = "manual_review"
 
@@ -47,6 +49,13 @@ class ResolutionReport:
     @property
     def blocking(self) -> bool:
         return any(issue.action == "reject" for issue in self.issues)
+
+
+@dataclass(frozen=True)
+class SuggestionScore:
+    record: TallyMasterRecord
+    score: float
+    breakdown: dict[str, float | str]
 
 
 class MappingRuleStore:
@@ -412,8 +421,9 @@ class PreImportResolver:
                 f"Fallback policy is '{policy}'. Add or update mapping rules for tenant '{tenant_id}', "
                 "fix OCR extraction, or route this invoice to manual review."
             ),
-            suggestions=tuple(candidate.name for candidate in suggestions),
-            suggestion_codes=tuple(candidate.code for candidate in suggestions),
+            suggestions=tuple(candidate.record.name for candidate in suggestions),
+            suggestion_codes=tuple(candidate.record.code for candidate in suggestions),
+            suggestion_score_breakdown=tuple(candidate.breakdown for candidate in suggestions),
             remediation=(
                 "Use one of the suggested master names/codes.",
                 "Add a tenant-specific mapping rule in JSON/SQLite.",
@@ -466,14 +476,110 @@ def _find_record_by_code(code: str, records: tuple[TallyMasterRecord, ...]) -> T
     return next((record for record in records if record.code and _key(record.code) == key), None)
 
 
-def _top_suggestions(value: str, records: tuple[TallyMasterRecord, ...], limit: int = 3) -> tuple[TallyMasterRecord, ...]:
+def _top_suggestions(value: str, records: tuple[TallyMasterRecord, ...], limit: int = 3) -> tuple[SuggestionScore, ...]:
     target = _key(value)
-    scored: list[tuple[int, TallyMasterRecord]] = []
-    for record in records:
-        name_key = _key(record.name)
-        overlap = len(set(target.split()) & set(name_key.split()))
-        if overlap > 0:
-            scored.append((overlap, record))
+    fuzzy_available = _rapidfuzz_available()
+    ranked: list[SuggestionScore] = []
 
-    ranked = [record for _, record in sorted(scored, key=lambda row: (-row[0], row[1].name))[:limit]]
-    return tuple(ranked)
+    for record in records:
+        best_score = -math.inf
+        best_breakdown: dict[str, float | str] | None = None
+        for candidate_value, source in _candidate_names(record):
+            score, breakdown = _weighted_similarity(target, _key(candidate_value), source=source, fuzzy_available=fuzzy_available)
+            if score > best_score:
+                best_score = score
+                best_breakdown = breakdown
+
+        if best_breakdown is None:
+            continue
+
+        ranked.append(SuggestionScore(record=record, score=best_score, breakdown=best_breakdown))
+
+    ranked.sort(key=lambda row: (-row.score, row.record.name))
+    return tuple(ranked[:limit])
+
+
+def _candidate_names(record: TallyMasterRecord) -> tuple[tuple[str, str], ...]:
+    values: list[tuple[str, str]] = [(record.name, "name")]
+    values.extend((alias, "alias") for alias in record.aliases)
+    return tuple(values)
+
+
+def _weighted_similarity(left: str, right: str, source: str, fuzzy_available: bool) -> tuple[float, dict[str, float | str]]:
+    normalized_left = _normalize_ocr_confusions(left)
+    normalized_right = _normalize_ocr_confusions(right)
+
+    edit_ratio = _normalized_levenshtein(normalized_left, normalized_right)
+    token_ratio = _token_sort_ratio(normalized_left, normalized_right)
+    token_overlap = _token_overlap(normalized_left, normalized_right)
+    alias_boost = 0.1 if source == "alias" else 0.0
+    ocr_boost = 0.05 if left != normalized_left or right != normalized_right else 0.0
+
+    score = (0.4 * edit_ratio) + (0.35 * token_ratio) + (0.15 * token_overlap) + alias_boost + ocr_boost
+
+    return score, {
+        "matched_on": source,
+        "weighted_score": round(score, 6),
+        "edit_ratio": round(edit_ratio, 6),
+        "token_sort_ratio": round(token_ratio, 6),
+        "token_overlap": round(token_overlap, 6),
+        "alias_boost": round(alias_boost, 6),
+        "ocr_boost": round(ocr_boost, 6),
+        "fuzzy_backend": "rapidfuzz" if fuzzy_available else "builtin",
+    }
+
+
+def _rapidfuzz_available() -> bool:
+    try:
+        import rapidfuzz  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _normalized_levenshtein(left: str, right: str) -> float:
+    if not left and not right:
+        return 1.0
+    if not left or not right:
+        return 0.0
+
+    previous = list(range(len(right) + 1))
+    for i, l_char in enumerate(left, start=1):
+        current = [i]
+        for j, r_char in enumerate(right, start=1):
+            insertions = previous[j] + 1
+            deletions = current[j - 1] + 1
+            substitutions = previous[j - 1] + (0 if l_char == r_char else 1)
+            current.append(min(insertions, deletions, substitutions))
+        previous = current
+
+    distance = previous[-1]
+    denominator = max(len(left), len(right))
+    return 1.0 - (distance / denominator)
+
+
+def _token_sort_ratio(left: str, right: str) -> float:
+    left_sorted = " ".join(sorted(left.split()))
+    right_sorted = " ".join(sorted(right.split()))
+    return _normalized_levenshtein(left_sorted, right_sorted)
+
+
+def _token_overlap(left: str, right: str) -> float:
+    left_tokens = set(left.split())
+    right_tokens = set(right.split())
+    if not left_tokens and not right_tokens:
+        return 1.0
+    union = left_tokens | right_tokens
+    if not union:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(union)
+
+
+def _normalize_ocr_confusions(value: str) -> str:
+    table = str.maketrans({
+        "0": "o",
+        "1": "l",
+        "5": "s",
+        "8": "b",
+    })
+    return value.translate(table)
