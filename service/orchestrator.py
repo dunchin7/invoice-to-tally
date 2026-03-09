@@ -6,12 +6,14 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any, Dict
 from uuid import uuid4
 
 from ingestion.router import IngestionError, route_extraction
 from llm.extractor import extract_structured_invoice
 from tally.master_data import TallyMasterDataClient, load_master_data_from_file
+from tally.client import TallyClient, TallyClientConfig, TallyUploadStatus
 from tally.xml_generator import generate_tally_xml
 from validation.errors import (
     AccountingValidationError,
@@ -28,6 +30,8 @@ class InvoiceJobState(str, Enum):
     EXTRACTED = "extracted"
     VALIDATED = "validated"
     REVIEW_REQUIRED = "review_required"
+    RETRY_PENDING = "retry_pending"
+    DRY_RUN = "dry_run"
     POSTED = "posted"
     FAILED = "failed"
 
@@ -65,6 +69,7 @@ class InvoiceOrchestrator:
         mapping_rules_db: str = "",
         fallback_policy: dict[str, str] | None = None,
         reconciliation_approved: bool = False,
+        dry_run: bool = False,
     ) -> Dict[str, Any]:
         job_id = str(uuid4())
         job_path = self.base_path / job_id
@@ -233,24 +238,76 @@ class InvoiceOrchestrator:
             generate_tally_xml(resolved_payload, str(xml_path))
             record["artifacts"]["generated_xml"] = str(xml_path)
 
-            upload_response = {
-                "status": "success",
-                "voucher_number": resolved_payload.get("invoice_number"),
-                "posted_at": datetime.now(timezone.utc).isoformat(),
+            if dry_run:
+                dry_run_response = {
+                    "status": "dry_run",
+                    "message": "Dry run completed: XML generated and validated, remote Tally upload skipped.",
+                    "idempotency_key": idempotency_key,
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                upload_response_path = job_path / "upload_response.json"
+                self._write_json(upload_response_path, dry_run_response)
+                record["artifacts"]["upload_response"] = str(upload_response_path)
+                transition(InvoiceJobState.DRY_RUN, "system:dry_run_completed", dry_run_response)
+                return record
+
+            xml_body = xml_path.read_text(encoding="utf-8")
+            client = self._build_tally_client(tally_base_url)
+            upload_request = {
+                "endpoint": client.endpoint,
+                "content_type": "application/xml; charset=utf-8",
                 "idempotency_key": idempotency_key,
+                "request_xml_path": str(xml_path),
             }
+            upload_request_path = job_path / "upload_request.json"
+            self._write_json(upload_request_path, upload_request)
+            record["artifacts"]["upload_request"] = str(upload_request_path)
+
+            upload_status = client.upload_xml(xml_body)
+            upload_response = self._serialize_upload_status(upload_status, idempotency_key=idempotency_key)
             upload_response_path = job_path / "upload_response.json"
             self._write_json(upload_response_path, upload_response)
             record["artifacts"]["upload_response"] = str(upload_response_path)
 
-            idempotency_store[idempotency_key] = {
-                "job_id": job_id,
-                "posted_at": upload_response["posted_at"],
-                "response": upload_response,
-            }
-            self._write_json(self.idempotency_store_path, idempotency_store)
+            outcome = self._classify_upload_outcome(upload_status)
+            if outcome == "success":
+                idempotency_store[idempotency_key] = {
+                    "job_id": job_id,
+                    "posted_at": upload_response["posted_at"],
+                    "response": upload_response,
+                }
+                self._write_json(self.idempotency_store_path, idempotency_store)
+                transition(InvoiceJobState.POSTED, "system:posted_to_tally", upload_response)
+                return record
 
-            transition(InvoiceJobState.POSTED, "system:posted_to_tally", upload_response)
+            if outcome == "retry":
+                retry_details = {
+                    "posting_status": "retry",
+                    "message": "Transient upload issue. Retry recommended.",
+                    "tally_response": upload_response,
+                }
+                transition(InvoiceJobState.RETRY_PENDING, "system:tally_post_retryable_failure", retry_details)
+                return record
+
+            if outcome == "manual_review":
+                queue_payload = {
+                    "job_id": job_id,
+                    "invoice_number": resolved_payload.get("invoice_number"),
+                    "confidence": extraction_confidence,
+                    "critical_failure": normalization.report.critical_failure,
+                    "reason": "tally_rejected",
+                    "tally_response": upload_response,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                self._append_jsonl(self.review_queue_path, queue_payload)
+                record["review_queue_entry"] = queue_payload
+                transition(InvoiceJobState.REVIEW_REQUIRED, "system:tally_post_manual_review", queue_payload)
+                return record
+            transition(
+                InvoiceJobState.FAILED,
+                "system:tally_post_failed",
+                {"posting_status": "failure", "tally_response": upload_response},
+            )
             return record
 
         except (SchemaValidationError, FieldNormalizationError) as exc:
@@ -321,3 +378,35 @@ class InvoiceOrchestrator:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload) + "\n")
+
+    @staticmethod
+    def _build_tally_client(tally_base_url: str) -> TallyClient:
+        parsed = urlparse(tally_base_url)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 9000
+        return TallyClient(TallyClientConfig(host=host, port=port))
+
+    @staticmethod
+    def _serialize_upload_status(status: TallyUploadStatus, *, idempotency_key: str) -> Dict[str, Any]:
+        return {
+            "status": "success" if status.ok else "failed",
+            "idempotency_key": idempotency_key,
+            "posted_at": datetime.now(timezone.utc).isoformat(),
+            "endpoint": status.endpoint,
+            "created": status.created,
+            "altered": status.altered,
+            "ignored": status.ignored,
+            "errors": status.errors,
+            "line_errors": list(status.line_errors),
+            "message": status.message,
+        }
+
+    @staticmethod
+    def _classify_upload_outcome(status: TallyUploadStatus) -> str:
+        if status.ok:
+            return "success"
+        if status.errors > 0 and status.line_errors:
+            return "manual_review"
+        if status.raw_response:
+            return "failure"
+        return "retry"
