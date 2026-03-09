@@ -182,12 +182,17 @@ Set these environment variables to enable direct upload to a running Tally insta
 * `TALLY_TIMEOUT_SECONDS` (default: `15`)
 * `TALLY_MAX_RETRIES` (default: `3`)
 * `TALLY_RETRY_BACKOFF_SECONDS` (default: `1`)
+* `OCR_TIMEOUT_SECONDS` (default: `30`)
+* `OCR_MAX_PAGES` (default: `20`)
 
 Use CLI flags to control upload behavior:
 
 ```bash
 python main.py --input samples/sample_invoice.pdf --upload-to-tally
 python main.py --input samples/sample_invoice.pdf --upload-to-tally --dry-run
+
+# Optional OCR operational limits
+python main.py --input samples/sample_invoice.pdf --ocr-timeout-seconds 45 --ocr-max-pages 30
 ```
 
 
