@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -364,11 +365,35 @@ class InvoiceOrchestrator:
     @contextmanager
     def _file_lock(path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a+", encoding="utf-8") as handle:
+        with path.open("a+b") as handle:
             try:
                 import fcntl
-            except ImportError as exc:  # pragma: no cover
-                raise RuntimeError("File locking is unsupported on this platform") from exc
+            except ImportError:
+                try:
+                    import msvcrt
+                except ImportError:
+                    yield
+                    return
+
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+
+                handle.seek(0)
+                while True:
+                    try:
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.05)
+
+                try:
+                    yield
+                finally:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                return
 
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
