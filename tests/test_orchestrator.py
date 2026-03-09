@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import json
 import threading
 
@@ -245,3 +246,18 @@ def test_idempotency_is_atomic_under_concurrency(tmp_path, monkeypatch):
             response_statuses.append(json.load(handle)["status"])
 
     assert sorted(response_statuses) == ["duplicate", "success"]
+
+
+def test_file_lock_falls_back_when_platform_locking_is_unavailable(tmp_path, monkeypatch):
+    lock_path = tmp_path / "idempotency_store.lock"
+    original_import = builtins.__import__
+
+    def _import_with_locking_unavailable(name, *args, **kwargs):
+        if name in {"fcntl", "msvcrt"}:
+            raise ImportError(f"{name} unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _import_with_locking_unavailable)
+
+    with InvoiceOrchestrator._file_lock(lock_path):
+        assert lock_path.exists()
