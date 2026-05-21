@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from service.orchestrator import InvoiceJobState, InvoiceOrchestrator
+from tally.client import TallyUploadStatus
 from tally.master_data import TallyMasterData, TallyMasterRecord
 from validation.errors import AccountingValidationError
 
@@ -72,6 +73,24 @@ def test_smoke_orchestrator_end_to_end_with_sample_fixture(tmp_path, monkeypatch
         lambda payload, **_kwargs: _Normalization(payload, _Report()),
     )
     monkeypatch.setattr("service.orchestrator.to_mutable_invoice", lambda payload: dict(payload))
+    monkeypatch.setattr(
+        "service.orchestrator.generate_tally_xml",
+        lambda _invoice, path, **_kw: Path(path).write_text("<ENVELOPE/>", encoding="utf-8"),
+    )
+
+    class _FakeTallyClient:
+        endpoint = "http://localhost:9000"
+
+        def upload_xml(self, _xml_body, idempotency_key, request_id):
+            return TallyUploadStatus(
+                ok=True, endpoint=self.endpoint, created=1,
+                raw_response="<ok/>", message="ok", request_id=request_id,
+            )
+
+    monkeypatch.setattr(
+        "service.orchestrator.InvoiceOrchestrator._build_tally_client",
+        lambda *_a, **_kw: _FakeTallyClient(),
+    )
 
     orchestrator = InvoiceOrchestrator(output_dir=str(tmp_path), low_confidence_threshold=0.8)
     result = orchestrator.process_invoice(input_path=str(sample_invoice_path), master_data_file="")

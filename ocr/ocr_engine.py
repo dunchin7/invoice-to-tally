@@ -155,15 +155,70 @@ def _check_timeout(*, started_at: float, timeout_seconds: float, processed_pages
 
 
 def _deskew_image(image: Image.Image) -> Image.Image:
+    """Detect and correct skew angle by maximising row-projection variance."""
+    try:
+        import numpy as np
+    except ImportError:
+        return image
+
+    gray = image.convert("L")
+    arr = np.array(gray, dtype=np.float32)
+    # Invert so text pixels are bright
+    if arr.mean() > 128:
+        arr = 255.0 - arr
+    threshold = arr.mean()
+    binary = (arr > threshold).astype(np.float32) * 255.0
+    binary_img = Image.fromarray(binary.astype(np.uint8))
+
+    best_angle, best_score = 0.0, -1.0
+    for angle in np.arange(-5.0, 5.1, 0.5):
+        rotated = np.array(binary_img.rotate(float(angle), expand=False, fillcolor=0), dtype=np.float32)
+        score = float(np.var(rotated.sum(axis=1)))
+        if score > best_score:
+            best_score = score
+            best_angle = float(angle)
+
+    if abs(best_angle) > 0.3:
+        return image.rotate(best_angle, expand=True, fillcolor=255)
     return image
 
 
 def _binarize_image(image: Image.Image) -> Image.Image:
-    return image
+    """Apply Otsu's thresholding to improve contrast for OCR."""
+    try:
+        import numpy as np
+    except ImportError:
+        from PIL import ImageOps
+        return ImageOps.autocontrast(image.convert("L")).convert("RGB")
+
+    gray = image.convert("L")
+    arr = np.array(gray, dtype=np.int32)
+    hist, _ = np.histogram(arr.flatten(), bins=256, range=(0, 256))
+    total = arr.size
+    sum_total = float(np.dot(np.arange(256, dtype=np.float64), hist.astype(np.float64)))
+    sum_b, weight_b, max_var, threshold = 0.0, 0, 0.0, 128
+    for t in range(256):
+        weight_b += int(hist[t])
+        if weight_b == 0:
+            continue
+        weight_f = total - weight_b
+        if weight_f == 0:
+            break
+        sum_b += float(t * int(hist[t]))
+        mean_b = sum_b / weight_b
+        mean_f = (sum_total - sum_b) / weight_f
+        var = float(weight_b) * float(weight_f) * (mean_b - mean_f) ** 2
+        if var > max_var:
+            max_var = var
+            threshold = t
+    binary = gray.point(lambda x: 255 if x > threshold else 0)
+    return binary.convert("RGB")
 
 
 def _enhance_contrast(image: Image.Image) -> Image.Image:
-    return image
+    """Boost image contrast to improve OCR on faded or low-contrast scans."""
+    from PIL import ImageEnhance
+    return ImageEnhance.Contrast(image).enhance(2.0)
 
 
 def _prepare_image(image: Image.Image, config: OCRConfig) -> tuple[Image.Image, list[str]]:

@@ -14,6 +14,7 @@ from typing import Any, Dict
 from uuid import uuid4
 
 from ingestion.router import IngestionError, route_extraction
+from settings import SETTINGS
 from llm.extractor import extract_structured_invoice
 from tally.master_data import TallyMasterDataClient, load_master_data_from_file
 from tally.client import TallyClient, TallyClientConfig, TallyUploadStatus
@@ -73,10 +74,6 @@ class InvoiceOrchestrator:
         self.idempotency_store_path = self.base_path / "idempotency_store.json"
         self.idempotency_lock_path = self.base_path / "idempotency_store.lock"
         self.review_queue_path = self.base_path / "manual_review_queue.jsonl"
-
-    @staticmethod
-    def _build_tally_client(base_url: str) -> TallyClient:
-        return TallyClient(TallyClientConfig(base_url=base_url))
 
     def process_invoice(
         self,
@@ -263,7 +260,23 @@ class InvoiceOrchestrator:
                     return record
 
                 xml_path = job_path / "tally_invoice.xml"
-                generate_tally_xml(resolved_payload, str(xml_path))
+                ledger_config = {
+                    "ledger_names": {
+                        "sales": SETTINGS.tally_sales_ledger,
+                        "cgst": SETTINGS.tally_cgst_ledger,
+                        "sgst": SETTINGS.tally_sgst_ledger,
+                        "igst": SETTINGS.tally_igst_ledger,
+                        "round_off": SETTINGS.tally_round_off_ledger,
+                    }
+                }
+                generate_tally_xml(
+                    resolved_payload,
+                    str(xml_path),
+                    company=SETTINGS.tally_company,
+                    voucher_type=SETTINGS.tally_voucher_type,
+                    voucher_action=SETTINGS.tally_voucher_action,
+                    config=ledger_config,
+                )
                 record["artifacts"]["generated_xml"] = str(xml_path)
 
                 if dry_run:
@@ -312,9 +325,9 @@ class InvoiceOrchestrator:
                     self._write_json_atomic(self.idempotency_store_path, idempotency_store)
 
             transition(
-                InvoiceJobState.POSTED,
-                "system:tally_posted",
-                {"posting_status": "success", "tally_response": upload_response},
+                state,
+                action,
+                {"posting_status": upload_response["status"], "tally_response": upload_response},
             )
             return record
 

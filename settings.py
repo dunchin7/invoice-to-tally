@@ -25,6 +25,12 @@ class Settings:
     tally_retry_backoff_seconds: float = 1.0
     ocr_timeout_seconds: float = 30.0
     ocr_max_pages: int = 20
+    # Tally ledger names — must match the target Tally chart of accounts
+    tally_sales_ledger: str = "Sales"
+    tally_cgst_ledger: str = "Output CGST"
+    tally_sgst_ledger: str = "Output SGST"
+    tally_igst_ledger: str = "Output IGST"
+    tally_round_off_ledger: str = "Round Off"
 
 
 def _parse_int(name: str, default: int) -> int:
@@ -87,6 +93,11 @@ def load_settings() -> Settings:
         tally_retry_backoff_seconds=_parse_float("TALLY_RETRY_BACKOFF_SECONDS", 1.0),
         ocr_timeout_seconds=_parse_float("OCR_TIMEOUT_SECONDS", 30.0),
         ocr_max_pages=_parse_int("OCR_MAX_PAGES", 20),
+        tally_sales_ledger=os.getenv("TALLY_SALES_LEDGER", "Sales"),
+        tally_cgst_ledger=os.getenv("TALLY_CGST_LEDGER", "Output CGST"),
+        tally_sgst_ledger=os.getenv("TALLY_SGST_LEDGER", "Output SGST"),
+        tally_igst_ledger=os.getenv("TALLY_IGST_LEDGER", "Output IGST"),
+        tally_round_off_ledger=os.getenv("TALLY_ROUND_OFF_LEDGER", "Round Off"),
     )
 
 

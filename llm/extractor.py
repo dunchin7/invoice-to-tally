@@ -9,7 +9,7 @@ from typing import Any, Callable
 from dotenv import load_dotenv
 from jsonschema import ValidationError, validate
 
-from llm.providers import GeminiProvider, LLMProvider
+from llm.providers import AzureOpenAIProvider, GeminiProvider, LLMProvider
 from schema.invoice_schema import invoice_schema
 
 load_dotenv()
@@ -158,8 +158,15 @@ def _compute_confidence(
     }
 
 
+def _get_default_provider() -> LLMProvider:
+    provider_type = os.getenv("LLM_PROVIDER", "azure_openai").lower()
+    if provider_type == "gemini":
+        return GeminiProvider()
+    return AzureOpenAIProvider()
+
+
 def extract_structured_invoice(raw_text: str, provider: LLMProvider | None = None) -> dict[str, Any]:
-    selected_provider = provider or GeminiProvider()
+    selected_provider = provider or _get_default_provider()
     diagnostics: dict[str, Any] = {
         "provider": selected_provider.name,
         "model": selected_provider.model_name,

@@ -83,7 +83,7 @@ def _patch_pipeline(monkeypatch, *, confidence=0.95, blocking=False):
     )
     monkeypatch.setattr(
         "service.orchestrator.generate_tally_xml",
-        lambda _invoice, path: Path(path).write_text("<ENVELOPE/>", encoding="utf-8"),
+        lambda _invoice, path, **_kw: Path(path).write_text("<ENVELOPE/>", encoding="utf-8"),
     )
 
 
@@ -104,7 +104,7 @@ def test_idempotency_prevents_duplicate_posting(tmp_path, monkeypatch):
 
     generated = []
 
-    def _generate_xml(_invoice, path):
+    def _generate_xml(_invoice, path, **_kw):
         generated.append(path)
         Path(path).write_text("<ENVELOPE/>", encoding="utf-8")
 
@@ -225,7 +225,7 @@ def test_idempotency_is_atomic_under_concurrency(tmp_path, monkeypatch):
         return original_builder(invoice)
 
     monkeypatch.setattr(orchestrator, "_build_idempotency_key", _waited_builder)
-    monkeypatch.setattr("service.orchestrator.generate_tally_xml", lambda _invoice, path: (generated.append(path), Path(path).write_text("<ENVELOPE/>", encoding="utf-8")))
+    monkeypatch.setattr("service.orchestrator.generate_tally_xml", lambda _invoice, path, **_kw: (generated.append(path), Path(path).write_text("<ENVELOPE/>", encoding="utf-8")))
     monkeypatch.setattr(
         "service.orchestrator.InvoiceOrchestrator._build_tally_client",
         lambda *_a, **_k: type("Client", (), {"endpoint": "http://localhost:9000", "upload_xml": lambda self, _xml, idempotency_key, request_id: TallyUploadStatus(ok=True, endpoint=self.endpoint, created=1, raw_response="<ok/>", message="ok", request_id=request_id)})(),

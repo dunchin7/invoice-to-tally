@@ -260,6 +260,52 @@ def _normalize_legacy(data: dict) -> dict:
     if normalized["total"] is None and normalized["subtotal"] is not None:
         normalized["total"] = (normalized["subtotal"] or 0) + (normalized["tax"] or 0)
 
+    return _apply_gst_consistency(normalized)
+
+
+def _apply_gst_consistency(normalized: dict) -> dict:
+    """Correct CGST/SGST vs IGST split based on seller and buyer state."""
+    seller_state = ((normalized.get("seller") or {}).get("address") or {}).get("state") or ""
+    buyer_state = ((normalized.get("buyer") or {}).get("address") or {}).get("state") or ""
+
+    if not seller_state or not buyer_state:
+        return normalized
+
+    def _norm(s: str) -> str:
+        return s.strip().lower().replace(" ", "").replace("-", "")
+
+    is_intra_state = _norm(seller_state) == _norm(buyer_state)
+
+    for item in normalized.get("line_items") or []:
+        cgst_amount = item.get("cgst_amount") or 0.0
+        sgst_amount = item.get("sgst_amount") or 0.0
+        igst_amount = item.get("igst_amount") or 0.0
+        cgst_rate = item.get("cgst_rate") or 0.0
+        sgst_rate = item.get("sgst_rate") or 0.0
+        igst_rate = item.get("igst_rate") or 0.0
+
+        has_cgst_sgst = cgst_amount > 0 or sgst_amount > 0
+        has_igst = igst_amount > 0
+
+        if is_intra_state and has_igst and not has_cgst_sgst:
+            # Inter-state amounts provided but transaction is intra-state — split IGST
+            half_rate = round(igst_rate / 2, 4)
+            half_amount = round(igst_amount / 2, 2)
+            item["cgst_rate"] = half_rate
+            item["cgst_amount"] = half_amount
+            item["sgst_rate"] = half_rate
+            item["sgst_amount"] = half_amount
+            item["igst_rate"] = 0.0
+            item["igst_amount"] = 0.0
+        elif not is_intra_state and has_cgst_sgst and not has_igst:
+            # Intra-state amounts provided but transaction is inter-state — combine to IGST
+            item["igst_rate"] = round(cgst_rate + sgst_rate, 4)
+            item["igst_amount"] = round(cgst_amount + sgst_amount, 2)
+            item["cgst_rate"] = 0.0
+            item["cgst_amount"] = 0.0
+            item["sgst_rate"] = 0.0
+            item["sgst_amount"] = 0.0
+
     return normalized
 
 

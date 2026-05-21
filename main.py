@@ -3,6 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from service.orchestrator import InvoiceOrchestrator
 
@@ -30,8 +35,32 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _validate_config() -> None:
+    """Fail fast with clear error messages for missing required configuration."""
+    provider = os.getenv("LLM_PROVIDER", "azure_openai").lower()
+    errors: list[str] = []
+
+    if provider in ("azure_openai", ""):
+        if not os.getenv("AZURE_OPENAI_API_KEY"):
+            errors.append("AZURE_OPENAI_API_KEY is not set (set LLM_PROVIDER=gemini to use Google Gemini instead)")
+        if not os.getenv("AZURE_OPENAI_ENDPOINT"):
+            errors.append("AZURE_OPENAI_ENDPOINT is not set (e.g. https://yourinstance.openai.azure.com)")
+        if not os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"):
+            errors.append("AZURE_OPENAI_DEPLOYMENT_NAME is not set (e.g. gpt-4o)")
+    elif provider == "gemini":
+        if not os.getenv("GEMINI_API_KEY"):
+            errors.append("GEMINI_API_KEY is not set")
+
+    if errors:
+        print("ERROR: Missing required configuration. Copy .env.example to .env and fill in the values.", file=sys.stderr)
+        for err in errors:
+            print(f"  - {err}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
     args = parse_args()
+    _validate_config()
     if args.ocr_timeout_seconds is not None:
         os.environ["OCR_TIMEOUT_SECONDS"] = str(args.ocr_timeout_seconds)
     if args.ocr_max_pages is not None:
