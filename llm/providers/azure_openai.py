@@ -168,7 +168,12 @@ class AzureOpenAIProvider(LLMProvider):
     ):
         resolved_key = api_key or os.getenv("AZURE_OPENAI_API_KEY")
         resolved_endpoint = endpoint or os.getenv("AZURE_OPENAI_ENDPOINT")
-        resolved_deployment = deployment_name or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
+        resolved_deployment = (
+            deployment_name
+            or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+            or os.getenv("AZURE_OPENAI_DEPLOYMENT")
+            or "gpt-4o"
+        )
         resolved_version = api_version or os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
 
         if not resolved_key:

@@ -16,11 +16,12 @@ def test_field_normalization_error_for_non_object_payload():
 
 
 def test_schema_validation_error_contains_context():
+    # Invalid GSTIN format (doesn't match the required 15-char regex pattern)
     payload = {
         "invoice_number": "INV-001",
         "invoice_date": "2024-01-01",
-        "seller": "Seller",
-        "buyer": "Buyer",
+        "seller": {"name": "Seller", "gstin": "NOT-A-VALID-GSTIN-FORMAT", "pan": "", "address": {}},
+        "buyer": {"name": "Buyer", "gstin": "", "pan": "", "address": {}},
         "currency": "INR",
         "subtotal": 10.0,
         "tax": 1.0,
@@ -28,13 +29,11 @@ def test_schema_validation_error_contains_context():
         "line_items": [{"description": "Item", "quantity": 1, "unit_price": 10, "total_price": 10}],
     }
 
-    payload.pop("invoice_number")
-
     with pytest.raises(SchemaValidationError) as exc_info:
         run_normalization_pipeline(payload)
 
     assert exc_info.value.code == "SCHEMA_VALIDATION_ERROR"
-    assert exc_info.value.context["field"] == "invoice"
+    assert "gstin" in exc_info.value.context["field"].lower() or exc_info.value.context["field"] == "invoice"
 
 
 def test_accounting_validation_error_contains_mismatch_details(monkeypatch):

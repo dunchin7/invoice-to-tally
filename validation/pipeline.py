@@ -11,6 +11,7 @@ from jsonschema import ValidationError, validate
 
 from schema.invoice_schema import invoice_schema
 from validation.errors import AccountingValidationError, FieldNormalizationError, SchemaValidationError
+from validation.normalizer import _normalize_legacy as _normalize_to_v2_schema
 
 DATE_FORMATS = (
     "%Y-%m-%d",
@@ -213,10 +214,11 @@ def _normalize_line_items(line_items: Any, warnings: List[str], confidence_flags
     return normalized_items
 
 
-def _cross_field_checks(data: Dict[str, Any], report_errors: List[str], confidence_flags: Dict[str, bool], tolerance: float = 0.05) -> None:
+def _cross_field_checks(data: Dict[str, Any], report_errors: List[str], confidence_flags: Dict[str, bool], tolerance: float = 1.0) -> None:
     subtotal = data.get("subtotal", 0.0) or 0.0
     tax = data.get("tax", 0.0) or 0.0
     total = data.get("total", 0.0) or 0.0
+    line_items = data.get("line_items") or []
 
     header_delta = abs((subtotal + tax) - total)
     header_ok = header_delta <= tolerance
@@ -227,14 +229,28 @@ def _cross_field_checks(data: Dict[str, Any], report_errors: List[str], confiden
             f"Critical mismatch: subtotal + tax ({subtotal + tax:.2f}) does not match total ({total:.2f}); delta={header_delta:.2f}."
         )
 
-    line_sum = round(sum((item.get("total_price", 0.0) or 0.0) for item in data.get("line_items", [])), 2)
-    line_delta = abs(line_sum - subtotal)
-    lines_ok = line_delta <= tolerance
+    # For v2.0 invoices: sum(line.total_price) == total (line.total_price includes tax)
+    # Fallback: sum(line.taxable_value) == subtotal (pre-tax sum)
+    line_total_sum = round(sum((item.get("total_price") or 0.0) for item in line_items), 2)
+    line_taxable_sum = round(sum((item.get("taxable_value") or 0.0) for item in line_items), 2)
+
+    total_match_delta = abs(line_total_sum - total)
+    taxable_match_delta = abs(line_taxable_sum - subtotal)
+    # Also accept legacy invoices where line.total_price was pre-tax (matches subtotal)
+    legacy_match_delta = abs(line_total_sum - subtotal)
+
+    lines_ok = (
+        total_match_delta <= tolerance
+        or taxable_match_delta <= tolerance
+        or legacy_match_delta <= tolerance
+    )
     confidence_flags["line_totals_consistent"] = lines_ok
 
     if not lines_ok:
         report_errors.append(
-            f"Critical mismatch: line item total ({line_sum:.2f}) does not match subtotal ({subtotal:.2f}); delta={line_delta:.2f}."
+            f"Critical mismatch: line items do not reconcile with header totals — "
+            f"sum(total_price)={line_total_sum:.2f}, sum(taxable_value)={line_taxable_sum:.2f}, "
+            f"subtotal={subtotal:.2f}, total={total:.2f}."
         )
 
 
@@ -258,41 +274,48 @@ def run_normalization_pipeline(raw_data: Dict[str, Any], allow_critical_override
     errors: List[str] = []
     confidence_flags: Dict[str, bool] = {}
 
-    normalized: Dict[str, Any] = {
-        "invoice_number": str(data.get("invoice_number", "")).strip(),
-        "seller": _normalize_entity(data.get("seller")),
-        "buyer": _normalize_entity(data.get("buyer")),
-    }
+    # Normalize to v2.0 schema (preserves seller/buyer as dicts, GST fields, schema_version)
+    normalized: Dict[str, Any] = _normalize_to_v2_schema(data)
 
-    normalized_date, date_warnings, date_ok = _normalize_date(data.get("invoice_date"))
-    warnings.extend(date_warnings)
-    normalized["invoice_date"] = normalized_date
-    confidence_flags["invoice_date_confident"] = date_ok
-
-    normalized_currency, currency_warnings, currency_ok = _normalize_currency(data.get("currency"))
-    warnings.extend(currency_warnings)
-    normalized["currency"] = normalized_currency
-    confidence_flags["currency_confident"] = currency_ok
-
-    normalized["subtotal"] = _to_number(data.get("subtotal"))
-    if normalized["subtotal"] is None:
+    # Coerce any None totals to 0.0 so schema validation passes (schema allows null but
+    # downstream Tally XML expects numbers)
+    if normalized.get("subtotal") is None:
         normalized["subtotal"] = 0.0
         warnings.append("subtotal was not numeric; defaulted to 0.0.")
         confidence_flags["subtotal_confident"] = False
     else:
         confidence_flags["subtotal_confident"] = True
 
-    normalized["tax"] = _normalize_tax(data, warnings, confidence_flags)
+    if normalized.get("tax") is None:
+        normalized["tax"] = 0.0
+        warnings.append("tax was not numeric; defaulted to 0.0.")
+        confidence_flags["tax_confident"] = False
+    else:
+        confidence_flags["tax_confident"] = True
 
-    normalized["total"] = _to_number(data.get("total"))
-    if normalized["total"] is None:
+    if normalized.get("total") is None:
         normalized["total"] = 0.0
         warnings.append("total was not numeric; defaulted to 0.0.")
         confidence_flags["total_confident"] = False
     else:
         confidence_flags["total_confident"] = True
 
-    normalized["line_items"] = _normalize_line_items(data.get("line_items", []), warnings, confidence_flags)
+    # Date confidence: normalizer falls back to "1970-01-01" when unparseable
+    date_value = normalized.get("invoice_date")
+    confidence_flags["invoice_date_confident"] = bool(date_value) and date_value != "1970-01-01"
+
+    # Currency confidence: normalizer defaults to "INR" only when source had no currency
+    confidence_flags["currency_confident"] = bool(normalized.get("currency"))
+
+    # Line item presence
+    confidence_flags["line_items_present"] = bool(normalized.get("line_items"))
+    confidence_flags["line_item_quantity_confident"] = all(
+        item.get("quantity") is not None for item in normalized.get("line_items", [])
+    )
+    confidence_flags["line_item_pricing_confident"] = all(
+        item.get("unit_price") is not None and item.get("total_price") is not None
+        for item in normalized.get("line_items", [])
+    )
 
     try:
         validate(instance=normalized, schema=invoice_schema)

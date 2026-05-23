@@ -31,6 +31,8 @@ class Settings:
     tally_sgst_ledger: str = "Output SGST"
     tally_igst_ledger: str = "Output IGST"
     tally_round_off_ledger: str = "Round Off"
+    # Max round-off (INR) tolerated when reconciling line items vs invoice total
+    tally_max_round_off: float = 50.0
 
 
 def _parse_int(name: str, default: int) -> int:
@@ -98,6 +100,7 @@ def load_settings() -> Settings:
         tally_sgst_ledger=os.getenv("TALLY_SGST_LEDGER", "Output SGST"),
         tally_igst_ledger=os.getenv("TALLY_IGST_LEDGER", "Output IGST"),
         tally_round_off_ledger=os.getenv("TALLY_ROUND_OFF_LEDGER", "Round Off"),
+        tally_max_round_off=_parse_float("TALLY_MAX_ROUND_OFF", 50.0),
     )
 
 

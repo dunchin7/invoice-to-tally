@@ -45,8 +45,8 @@ def _validate_config() -> None:
             errors.append("AZURE_OPENAI_API_KEY is not set (set LLM_PROVIDER=gemini to use Google Gemini instead)")
         if not os.getenv("AZURE_OPENAI_ENDPOINT"):
             errors.append("AZURE_OPENAI_ENDPOINT is not set (e.g. https://yourinstance.openai.azure.com)")
-        if not os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"):
-            errors.append("AZURE_OPENAI_DEPLOYMENT_NAME is not set (e.g. gpt-4o)")
+        if not (os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or os.getenv("AZURE_OPENAI_DEPLOYMENT")):
+            errors.append("AZURE_OPENAI_DEPLOYMENT_NAME (or AZURE_OPENAI_DEPLOYMENT) is not set (e.g. gpt-4o)")
     elif provider == "gemini":
         if not os.getenv("GEMINI_API_KEY"):
             errors.append("GEMINI_API_KEY is not set")

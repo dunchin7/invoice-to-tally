@@ -260,7 +260,48 @@ def _normalize_legacy(data: dict) -> dict:
     if normalized["total"] is None and normalized["subtotal"] is not None:
         normalized["total"] = (normalized["subtotal"] or 0) + (normalized["tax"] or 0)
 
+    normalized = _reconcile_header_with_lines(normalized)
     return _apply_gst_consistency(normalized)
+
+
+def _reconcile_header_with_lines(normalized: dict, tolerance: float = 1.0) -> dict:
+    """Override header totals when line items reconcile internally but header disagrees.
+
+    LLM/OCR extraction sometimes misreads single digits in the header summary while
+    line item values remain correct. If sum(taxable_value)+sum(tax) reconciles to
+    sum(total_price) internally, treat that as the truth and overwrite the header.
+    """
+    line_items = normalized.get("line_items") or []
+    if not line_items:
+        return normalized
+
+    line_taxable = sum(item.get("taxable_value") or 0.0 for item in line_items)
+    line_tax = sum(item.get("tax_amount") or 0.0 for item in line_items)
+    line_total = sum(item.get("total_price") or 0.0 for item in line_items)
+
+    # Only trust line items if they reconcile internally
+    if line_taxable <= 0 or line_total <= 0:
+        return normalized
+    if abs((line_taxable + line_tax) - line_total) > tolerance:
+        return normalized
+
+    header_subtotal = normalized.get("subtotal") or 0.0
+    header_tax = normalized.get("tax") or 0.0
+    header_total = normalized.get("total") or 0.0
+
+    # If header already matches line items, no adjustment needed
+    if (
+        abs(header_subtotal - line_taxable) <= tolerance
+        and abs(header_tax - line_tax) <= tolerance
+        and abs(header_total - line_total) <= tolerance
+    ):
+        return normalized
+
+    # Header diverges from internally-consistent line items — overwrite with line sums
+    normalized["subtotal"] = round(line_taxable, 2)
+    normalized["tax"] = round(line_tax, 2)
+    normalized["total"] = round(line_total, 2)
+    return normalized
 
 
 def _apply_gst_consistency(normalized: dict) -> dict:

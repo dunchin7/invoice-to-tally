@@ -13,8 +13,14 @@ from urllib.parse import urlparse
 from typing import Any, Dict
 from uuid import uuid4
 
+import logging
+
+import requests
+
 from ingestion.router import IngestionError, route_extraction
 from settings import SETTINGS
+
+logger = logging.getLogger(__name__)
 from llm.extractor import extract_structured_invoice
 from tally.master_data import TallyMasterDataClient, load_master_data_from_file
 from tally.client import TallyClient, TallyClientConfig, TallyUploadStatus
@@ -150,7 +156,18 @@ class InvoiceOrchestrator:
                 master_data = load_master_data_from_file(master_data_file)
             else:
                 master_client = TallyMasterDataClient(base_url=tally_base_url)
-                master_data = master_client.get_master_data()
+                try:
+                    master_data = master_client.get_master_data()
+                except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as exc:
+                    logger.warning(
+                        "Tally master data unreachable at %s (%s); proceeding with empty master data.",
+                        tally_base_url, exc,
+                    )
+                    from tally.master_data import TallyMasterData
+                    master_data = TallyMasterData(
+                        parties=(), ledgers=(), stock_items=(),
+                        fetched_at_epoch=0.0, source="unavailable",
+                    )
 
             resolver = PreImportResolver(
                 master_data=master_data,
@@ -267,7 +284,8 @@ class InvoiceOrchestrator:
                         "sgst": SETTINGS.tally_sgst_ledger,
                         "igst": SETTINGS.tally_igst_ledger,
                         "round_off": SETTINGS.tally_round_off_ledger,
-                    }
+                    },
+                    "max_round_off": str(SETTINGS.tally_max_round_off),
                 }
                 generate_tally_xml(
                     resolved_payload,
