@@ -4,21 +4,25 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
+from service.batch_processor import BatchProcessor
 from service.orchestrator import InvoiceOrchestrator
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Invoice OCR → LLM → Validation → Tally orchestration")
-    parser.add_argument("--input", required=True, help="Path to invoice PDF/image/document")
+    parser.add_argument("--input", required=True, help="Path to invoice file, OR a directory of invoices for batch processing")
     parser.add_argument("--orchestration-output", default="outputs/orchestration")
     parser.add_argument("--low-confidence-threshold", type=float, default=0.8)
     parser.add_argument("--allow-accounting-override", action="store_true")
     parser.add_argument("--operator", default="system")
+    parser.add_argument("--batch-workers", type=int, default=4, help="Concurrent workers when --input is a directory")
+    parser.add_argument("--batch-recursive", action="store_true", help="Recurse into subdirectories when --input is a directory")
 
     parser.add_argument("--tenant-id", default="default")
     parser.add_argument("--master-data-file", default="")
@@ -70,8 +74,8 @@ def main() -> None:
         output_dir=args.orchestration_output,
         low_confidence_threshold=args.low_confidence_threshold,
     )
-    result = orchestrator.process_invoice(
-        input_path=args.input,
+
+    process_kwargs = dict(
         operator=args.operator,
         allow_accounting_override=args.allow_accounting_override,
         tenant_id=args.tenant_id,
@@ -88,6 +92,20 @@ def main() -> None:
         dry_run=args.dry_run,
     )
 
+    input_path = Path(args.input)
+    if input_path.is_dir():
+        processor = BatchProcessor(orchestrator, max_workers=args.batch_workers)
+        batch_result = processor.process_directory(
+            input_dir=str(input_path),
+            recursive=args.batch_recursive,
+            process_kwargs=process_kwargs,
+        )
+        print(json.dumps(batch_result.to_dict(), indent=2))
+        if batch_result.summary.failed > 0:
+            sys.exit(2)
+        return
+
+    result = orchestrator.process_invoice(input_path=args.input, **process_kwargs)
     print(json.dumps(result, indent=2))
 
 
