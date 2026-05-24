@@ -34,6 +34,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stock-fallback", choices=["auto_create", "reject", "manual_review"], default="manual_review")
     parser.add_argument("--reconciliation-approved", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--invoice-direction",
+        choices=["sales", "purchase", "auto"],
+        default="auto",
+        help="Force voucher polarity. 'auto' detects from --own-gstins or TALLY_OWN_GSTINS.",
+    )
+    parser.add_argument(
+        "--own-gstins",
+        default="",
+        help="Comma-separated list of GSTINs owned by the tenant; overrides TALLY_OWN_GSTINS.",
+    )
     parser.add_argument("--ocr-timeout-seconds", type=float, default=None)
     parser.add_argument("--ocr-max-pages", type=int, default=None)
     return parser.parse_args()
@@ -75,6 +86,10 @@ def main() -> None:
         low_confidence_threshold=args.low_confidence_threshold,
     )
 
+    own_gstins_override: tuple[str, ...] | None = None
+    if args.own_gstins:
+        own_gstins_override = tuple(g.strip().upper() for g in args.own_gstins.split(",") if g.strip())
+
     process_kwargs = dict(
         operator=args.operator,
         allow_accounting_override=args.allow_accounting_override,
@@ -90,6 +105,8 @@ def main() -> None:
         },
         reconciliation_approved=args.reconciliation_approved,
         dry_run=args.dry_run,
+        invoice_direction=None if args.invoice_direction == "auto" else args.invoice_direction,
+        own_gstins=own_gstins_override,
     )
 
     input_path = Path(args.input)

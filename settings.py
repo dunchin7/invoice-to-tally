@@ -31,6 +31,15 @@ class Settings:
     tally_sgst_ledger: str = "Output SGST"
     tally_igst_ledger: str = "Output IGST"
     tally_round_off_ledger: str = "Round Off"
+    # Purchase voucher ledger names (used when invoice direction is "purchase")
+    tally_purchase_ledger: str = "Purchase"
+    tally_input_cgst_ledger: str = "Input CGST"
+    tally_input_sgst_ledger: str = "Input SGST"
+    tally_input_igst_ledger: str = "Input IGST"
+    # GSTINs owned by the tenant (the CA's own business or specific client).
+    # Used to auto-detect sales vs purchase: if buyer.gstin matches → purchase;
+    # if seller.gstin matches → sales; if neither matches → review_required.
+    tally_own_gstins: tuple[str, ...] = ()
     # Max round-off (INR) tolerated when reconciling line items vs invoice total
     tally_max_round_off: float = 50.0
 
@@ -60,6 +69,14 @@ def _parse_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_csv_tuple(name: str) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    if not raw:
+        return ()
+    items = (item.strip().upper() for item in raw.split(","))
+    return tuple(item for item in items if item)
 
 
 def _parse_json_mapping(name: str) -> dict[str, str]:
@@ -100,6 +117,11 @@ def load_settings() -> Settings:
         tally_sgst_ledger=os.getenv("TALLY_SGST_LEDGER", "Output SGST"),
         tally_igst_ledger=os.getenv("TALLY_IGST_LEDGER", "Output IGST"),
         tally_round_off_ledger=os.getenv("TALLY_ROUND_OFF_LEDGER", "Round Off"),
+        tally_purchase_ledger=os.getenv("TALLY_PURCHASE_LEDGER", "Purchase"),
+        tally_input_cgst_ledger=os.getenv("TALLY_INPUT_CGST_LEDGER", "Input CGST"),
+        tally_input_sgst_ledger=os.getenv("TALLY_INPUT_SGST_LEDGER", "Input SGST"),
+        tally_input_igst_ledger=os.getenv("TALLY_INPUT_IGST_LEDGER", "Input IGST"),
+        tally_own_gstins=_parse_csv_tuple("TALLY_OWN_GSTINS"),
         tally_max_round_off=_parse_float("TALLY_MAX_ROUND_OFF", 50.0),
     )
 

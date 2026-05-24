@@ -9,11 +9,16 @@ from xml.etree.ElementTree import Element, ElementTree, SubElement, tostring
 TWOPLACES = Decimal("0.01")
 DEFAULT_LEDGER_NAMES = {
     "sales": "Sales",
+    "purchase": "Purchase",
     "cgst": "CGST",
     "sgst": "SGST",
     "igst": "IGST",
+    "input_cgst": "Input CGST",
+    "input_sgst": "Input SGST",
+    "input_igst": "Input IGST",
     "round_off": "Round Off",
     "receivables": None,
+    "payables": None,
 }
 DEFAULT_VOUCHER_TYPES = {
     "tax_invoice": "Sales",
@@ -22,6 +27,14 @@ DEFAULT_VOUCHER_TYPES = {
     "proforma_invoice": "Sales",
     "receipt": "Receipt",
     None: "Sales",
+}
+DEFAULT_PURCHASE_VOUCHER_TYPES = {
+    "tax_invoice": "Purchase",
+    "credit_note": "Debit Note",
+    "debit_note": "Credit Note",
+    "proforma_invoice": "Purchase",
+    "receipt": "Payment",
+    None: "Purchase",
 }
 
 
@@ -82,10 +95,22 @@ def _normalize_tally_date(invoice_date: str) -> str:
     raise ValueError(f"Unsupported invoice_date format: {invoice_date}")
 
 
-def _resolve_voucher_type(invoice: dict[str, Any], config: dict[str, Any]) -> str:
+def _resolve_direction(invoice: dict[str, Any], config: dict[str, Any]) -> str:
+    """Return 'sales' or 'purchase' for voucher polarity. Defaults to sales."""
+    explicit = config.get("direction") or invoice.get("direction")
+    if explicit in ("sales", "purchase"):
+        return explicit
+    return "sales"
+
+
+def _resolve_voucher_type(invoice: dict[str, Any], config: dict[str, Any], direction: str) -> str:
     configured = config.get("voucher_type")
     if configured:
         return str(configured)
+
+    if direction == "purchase":
+        mapping = {**DEFAULT_PURCHASE_VOUCHER_TYPES, **config.get("voucher_type_map", {})}
+        return mapping.get(invoice.get("invoice_type"), "Purchase")
 
     mapping = {**DEFAULT_VOUCHER_TYPES, **config.get("voucher_type_map", {})}
     return mapping.get(invoice.get("invoice_type"), "Sales")
@@ -101,6 +126,8 @@ def _build_ledger_resolver(config: dict[str, Any]) -> LedgerResolver:
     def _resolve(role: str, invoice: dict[str, Any]) -> str:
         if role == "receivables":
             return configured_ledgers.get(role) or _party_ledger_name(invoice.get("buyer"))
+        if role == "payables":
+            return configured_ledgers.get(role) or _party_ledger_name(invoice.get("seller"))
         return configured_ledgers[role]
 
     return _resolve
@@ -156,31 +183,58 @@ def _validate_balancing(entries: list[VoucherLedgerEntry]) -> None:
 def map_invoice_to_voucher(invoice: dict[str, Any], config: dict[str, Any] | None = None) -> VoucherMapping:
     config = config or {}
     ledger_resolver = _build_ledger_resolver(config)
+    direction = _resolve_direction(invoice, config)
+    is_purchase = direction == "purchase"
 
     amounts = _collect_amounts(invoice)
-    receivables_ledger = ledger_resolver("receivables", invoice)
+
+    # Sales: buyer is Dr (receivable); Sales/Output GST are Cr.
+    # Purchase: seller is Cr (payable); Purchase/Input GST are Dr.
+    if is_purchase:
+        party_ledger = ledger_resolver("payables", invoice)
+        party_entry_type = "credit"
+        line_entry_type = "debit"
+        line_ledger_role = "purchase"
+        tax_role_map = {"cgst": "input_cgst", "sgst": "input_sgst", "igst": "input_igst"}
+    else:
+        party_ledger = ledger_resolver("receivables", invoice)
+        party_entry_type = "debit"
+        line_entry_type = "credit"
+        line_ledger_role = "sales"
+        tax_role_map = {"cgst": "cgst", "sgst": "sgst", "igst": "igst"}
 
     entries: list[VoucherLedgerEntry] = [
-        VoucherLedgerEntry(ledger_name=receivables_ledger, amount=amounts["total"], entry_type="debit"),
+        VoucherLedgerEntry(ledger_name=party_ledger, amount=amounts["total"], entry_type=party_entry_type),
         VoucherLedgerEntry(
-            ledger_name=ledger_resolver("sales", invoice),
+            ledger_name=ledger_resolver(line_ledger_role, invoice),
             amount=amounts["taxable"],
-            entry_type="credit",
+            entry_type=line_entry_type,
         ),
     ]
 
     for tax_role in ("cgst", "sgst", "igst"):
         amount = amounts[tax_role]
         if amount > 0:
-            entries.append(VoucherLedgerEntry(ledger_name=ledger_resolver(tax_role, invoice), amount=amount, entry_type="credit"))
+            entries.append(
+                VoucherLedgerEntry(
+                    ledger_name=ledger_resolver(tax_role_map[tax_role], invoice),
+                    amount=amount,
+                    entry_type=line_entry_type,
+                )
+            )
 
     max_round_off = _to_decimal(config.get("max_round_off", "1.00"))
     if abs(amounts["round_off"]) > max_round_off:
         raise VoucherBalanceError(f"Round-off {amounts['round_off']} exceeds configured threshold {max_round_off}")
 
     if amounts["round_off"] != 0:
+        # On sales the "natural" credit side is taxable+taxes summing to less than total → round_off as Cr balances the Dr party.
+        # On purchase the polarity flips: the Dr side is short → round_off goes on Dr (i.e. line side).
         round_off_amount = abs(amounts["round_off"])
-        round_off_type = "credit" if amounts["round_off"] > 0 else "debit"
+        if amounts["round_off"] > 0:
+            round_off_type = "credit" if not is_purchase else "debit"
+        else:
+            round_off_type = "debit" if not is_purchase else "credit"
         entries.append(VoucherLedgerEntry(ledger_name=ledger_resolver("round_off", invoice), amount=round_off_amount, entry_type=round_off_type))
 
     _validate_balancing(entries)
@@ -188,8 +242,8 @@ def map_invoice_to_voucher(invoice: dict[str, Any], config: dict[str, Any] | Non
     return VoucherMapping(
         date=_normalize_tally_date(invoice["invoice_date"]),
         voucher_number=str(invoice["invoice_number"]),
-        voucher_type=_resolve_voucher_type(invoice, config),
-        party_ledger_name=receivables_ledger,
+        voucher_type=_resolve_voucher_type(invoice, config, direction),
+        party_ledger_name=party_ledger,
         narration=config.get("narration") or "Imported from Invoice AI",
         entries=entries,
     )

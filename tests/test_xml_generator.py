@@ -98,6 +98,68 @@ class TallyXMLGeneratorTests(unittest.TestCase):
         ]
         self.assertIn(("Round Off Adj", "No", "0.25"), ledgers)
 
+    def test_purchase_invoice_flips_polarity_with_input_gst_ledgers(self):
+        invoice = self._base_invoice()
+        invoice["seller"] = {"name": "ACME Suppliers Pvt Ltd", "gstin": "27AAAPL1234C1Z5"}
+        invoice["buyer"] = {"name": "Our Trading Co", "gstin": "29AABCS1429B1ZS"}
+        invoice["line_items"] = [
+            {"description": "Raw Material", "taxable_value": 10000, "cgst_amount": 900, "sgst_amount": 900, "igst_amount": 0, "tax_amount": 1800, "total_price": 11800},
+        ]
+        invoice["subtotal"] = 10000
+        invoice["tax"] = 1800
+        invoice["total"] = 11800
+        invoice["direction"] = "purchase"
+
+        mapping = map_invoice_to_voucher(invoice)
+
+        self.assertEqual(mapping.voucher_type, "Purchase")
+        ledger_amounts = {(e.ledger_name, e.entry_type): float(e.amount) for e in mapping.entries}
+        # Vendor (seller) is credited (payable)
+        self.assertEqual(ledger_amounts[("ACME Suppliers Pvt Ltd", "credit")], 11800.0)
+        # Purchase ledger is debited (expense)
+        self.assertEqual(ledger_amounts[("Purchase", "debit")], 10000.0)
+        # Input GST is debited (ITC asset)
+        self.assertEqual(ledger_amounts[("Input CGST", "debit")], 900.0)
+        self.assertEqual(ledger_amounts[("Input SGST", "debit")], 900.0)
+
+    def test_purchase_interstate_uses_input_igst(self):
+        invoice = self._base_invoice()
+        invoice["seller"] = {"name": "Karnataka Vendor"}
+        invoice["buyer"] = {"name": "TN Customer"}
+        invoice["line_items"] = [
+            {"description": "Services", "taxable_value": 50000, "igst_amount": 9000, "tax_amount": 9000, "total_price": 59000},
+        ]
+        invoice["subtotal"] = 50000
+        invoice["tax"] = 9000
+        invoice["total"] = 59000
+
+        mapping = map_invoice_to_voucher(invoice, config={"direction": "purchase"})
+
+        ledger_amounts = {(e.ledger_name, e.entry_type): float(e.amount) for e in mapping.entries}
+        self.assertEqual(ledger_amounts[("Karnataka Vendor", "credit")], 59000.0)
+        self.assertEqual(ledger_amounts[("Purchase", "debit")], 50000.0)
+        self.assertEqual(ledger_amounts[("Input IGST", "debit")], 9000.0)
+        # No output GST entries
+        self.assertNotIn(("CGST", "credit"), ledger_amounts)
+        self.assertNotIn(("IGST", "credit"), ledger_amounts)
+
+    def test_purchase_credit_note_becomes_debit_note_voucher(self):
+        invoice = self._base_invoice()
+        invoice["invoice_type"] = "credit_note"
+        invoice["seller"] = {"name": "Vendor X"}
+        invoice["buyer"] = {"name": "Our Co"}
+        invoice["line_items"] = [
+            {"description": "Returned item", "taxable_value": 1000, "cgst_amount": 90, "sgst_amount": 90, "tax_amount": 180, "total_price": 1180},
+        ]
+        invoice["subtotal"] = 1000
+        invoice["tax"] = 180
+        invoice["total"] = 1180
+
+        mapping = map_invoice_to_voucher(invoice, config={"direction": "purchase"})
+
+        # Vendor-side credit note (refund from vendor) should post as a Debit Note in our books
+        self.assertEqual(mapping.voucher_type, "Debit Note")
+
     def test_unbalanced_invoice_raises_error(self):
         invoice = self._base_invoice()
         invoice["line_items"] = [

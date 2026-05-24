@@ -19,6 +19,10 @@ invoice_schema = {
         "po_number": {"type": ["string", "null"]},
         "place_of_supply": {"type": ["string", "null"]},
         "reverse_charge": {"type": ["boolean", "null"]},
+        "direction": {
+            "type": ["string", "null"],
+            "enum": ["sales", "purchase", None],
+        },
         "transport": {
             "type": ["object", "null"],
             "properties": {

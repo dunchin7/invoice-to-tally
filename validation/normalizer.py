@@ -220,6 +220,7 @@ def _normalize_legacy(data: dict) -> dict:
         "po_number": _clean_text(data.get("po_number") or data.get("purchase_order_number")),
         "place_of_supply": _clean_text(data.get("place_of_supply")),
         "reverse_charge": _to_bool_or_none(data.get("reverse_charge")),
+        "direction": _clean_text(data.get("direction")),
         "transport": _normalize_transport(data),
         "seller": _normalize_party(data.get("seller")),
         "buyer": _normalize_party(data.get("buyer")),
@@ -302,6 +303,27 @@ def _reconcile_header_with_lines(normalized: dict, tolerance: float = 1.0) -> di
     normalized["tax"] = round(line_tax, 2)
     normalized["total"] = round(line_total, 2)
     return normalized
+
+
+def detect_direction(invoice: dict, own_gstins: tuple[str, ...] | list[str] = ()) -> str | None:
+    """Return 'sales' if seller GSTIN matches an own GSTIN, 'purchase' if buyer matches.
+
+    Returns None when no GSTIN matches (caller should route to manual review) or
+    when both GSTINs match (ambiguous self-invoice).
+    """
+    own = {g.strip().upper() for g in own_gstins if g and isinstance(g, str)}
+    if not own:
+        return None
+    seller_gstin = ((invoice.get("seller") or {}).get("gstin") or "").strip().upper()
+    buyer_gstin = ((invoice.get("buyer") or {}).get("gstin") or "").strip().upper()
+
+    seller_match = seller_gstin in own
+    buyer_match = buyer_gstin in own
+    if seller_match and not buyer_match:
+        return "sales"
+    if buyer_match and not seller_match:
+        return "purchase"
+    return None
 
 
 def _apply_gst_consistency(normalized: dict) -> dict:

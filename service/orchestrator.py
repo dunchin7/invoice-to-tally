@@ -31,6 +31,7 @@ from validation.errors import (
     SchemaValidationError,
     ValidationFlowError,
 )
+from validation.normalizer import detect_direction
 from validation.pipeline import run_normalization_pipeline, to_mutable_invoice
 from validation.pre_import import MappingRuleStore, PreImportResolver
 
@@ -94,6 +95,8 @@ class InvoiceOrchestrator:
         fallback_policy: dict[str, str] | None = None,
         reconciliation_approved: bool = False,
         dry_run: bool = False,
+        invoice_direction: str | None = None,
+        own_gstins: tuple[str, ...] | list[str] | None = None,
     ) -> Dict[str, Any]:
         job_id = str(uuid4())
         job_path = self.base_path / job_id
@@ -276,22 +279,43 @@ class InvoiceOrchestrator:
                     transition(InvoiceJobState.POSTED, "system:duplicate_post_prevented", response)
                     return record
 
+                effective_own_gstins = tuple(own_gstins) if own_gstins is not None else SETTINGS.tally_own_gstins
+                if invoice_direction in ("sales", "purchase"):
+                    direction = invoice_direction
+                else:
+                    detected = detect_direction(resolved_payload, effective_own_gstins)
+                    direction = detected or resolved_payload.get("direction") or "sales"
+                resolved_payload["direction"] = direction
+                record["direction"] = direction
+
                 xml_path = job_path / "tally_invoice.xml"
                 ledger_config = {
+                    "direction": direction,
                     "ledger_names": {
                         "sales": SETTINGS.tally_sales_ledger,
+                        "purchase": SETTINGS.tally_purchase_ledger,
                         "cgst": SETTINGS.tally_cgst_ledger,
                         "sgst": SETTINGS.tally_sgst_ledger,
                         "igst": SETTINGS.tally_igst_ledger,
+                        "input_cgst": SETTINGS.tally_input_cgst_ledger,
+                        "input_sgst": SETTINGS.tally_input_sgst_ledger,
+                        "input_igst": SETTINGS.tally_input_igst_ledger,
                         "round_off": SETTINGS.tally_round_off_ledger,
                     },
                     "max_round_off": str(SETTINGS.tally_max_round_off),
                 }
+                # Only pass SETTINGS.tally_voucher_type if it was explicitly customized;
+                # otherwise let the generator pick Sales or Purchase based on direction.
+                explicit_voucher_type = (
+                    SETTINGS.tally_voucher_type
+                    if SETTINGS.tally_voucher_type and SETTINGS.tally_voucher_type != "Sales"
+                    else None
+                )
                 generate_tally_xml(
                     resolved_payload,
                     str(xml_path),
                     company=SETTINGS.tally_company,
-                    voucher_type=SETTINGS.tally_voucher_type,
+                    voucher_type=explicit_voucher_type,
                     voucher_action=SETTINGS.tally_voucher_action,
                     config=ledger_config,
                 )
